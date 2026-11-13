@@ -87,7 +87,7 @@ The lifecycle of a broadcast:
 | GET | `/streams/me/bans` | Bearer | List users banned from your chat |
 | POST | `/streams/me/bans` | Bearer | Ban a user from your chat |
 | DELETE | `/streams/me/bans/:userId` | Bearer | Unban a user |
-| GET | `/legal/privacy`, `/legal/terms` (no API prefix) | **Public** | Privacy Policy and Terms of Use (static HTML from `public/`) |
+| GET | `/public/<file>` (no API prefix) | **Public** | Static files from `public/`: HTML, images, videos, … Includes `/public/privacy_policy` and `/public/terms_use`. |
 | WS | `/ws` (no API prefix) | **Public** | [Real-time events](#websocket-events): stream started/ended, viewer counts, chat |
 
 ---
@@ -3245,7 +3245,14 @@ The database schema is created and updated automatically from the entities at st
 
 The WebSocket path `/ws` is fixed and not configurable.
 
-The legal pages are static files in `public/` (`privacy.html`, `terms.html`), served at `/legal/privacy` and `/legal/terms` by `@nestjs/serve-static`. Deploy the `public/` folder next to `dist/`.
+Everything in the `public/` folder is served at `/public/<path>` by `@nestjs/serve-static`: HTML, images, videos and any other file, with the right `Content-Type`, caching headers, and range requests, so videos can seek. Subfolders work: `public/images/logo.png` is served at `/public/images/logo.png`. `.html` is optional in URLs, dotfiles aren't served, and there are no directory listings.
+
+| Page | URL |
+|---|---|
+| Privacy Policy | `/public/privacy_policy` (file `public/privacy_policy.html`) |
+| Terms of Use | `/public/terms_use` (file `public/terms_use.html`) |
+
+Deploy the `public/` folder next to `dist/`. Anything put there is publicly downloadable, so don't store private files in it.
 
 ---
 

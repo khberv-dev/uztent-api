@@ -24,11 +24,12 @@ import { UsersModule } from './users/users.module.js';
         autoLoadEntities: true,
       }),
     }),
-    // Legal pages: /legal/privacy, /legal/terms (outside API_PREFIX).
-    // serveRoot keeps the module's catch-all route under /legal, away from the API.
+    // Any file in public/ (HTML, images, videos, …) at /public/<path>,
+    // outside API_PREFIX; `.html` is optional in URLs. serveRoot keeps the
+    // module's catch-all route under /public, away from the API.
     ServeStaticModule.forRoot({
       rootPath: join(import.meta.dirname, '..', 'public'),
-      serveRoot: '/legal',
+      serveRoot: '/public',
       serveStaticOptions: { extensions: ['html'], index: false },
     }),
     RedisModule,
