@@ -28,8 +28,8 @@ Uztent is a live-streaming backend. Streamers broadcast from OBS (or any RTMP en
  │ MediaMTX │ ────────── webhooks ────▶ │   API    │ ◀──┼───┘
  │          │ ◀──── /v3/paths/list ──── │ (NestJS) │    │
  │  ffmpeg  │       (viewer counts)     └────┬─────┘    │
- │ 1080/720 │                              │      │     │
- │   /480   │ ──────────────── HLS ────────┼──────┼─────┘
+ │  → 1080  │                              │      │     │
+ │          │ ──────────────── HLS ────────┼──────┼─────┘
  └──────────┘                     ┌────────┘      └────────┐
                                   ▼                        ▼
                          PostgreSQL                     Redis
@@ -40,7 +40,7 @@ Uztent is a live-streaming backend. Streamers broadcast from OBS (or any RTMP en
 The lifecycle of a broadcast:
 1. **Setup:** the user generates a stream key (`POST /streams/me/key`) and pastes it into OBS.
 2. **Go live:** MediaMTX asks the API to check the key (auth webhook). Once video flows, it reports `online`. The API creates a live session in Redis and broadcasts `stream.started`.
-3. **Transcode:** MediaMTX's ffmpeg republishes 1080p, 720p and 480p renditions. Viewers pick one and play it over HLS.
+3. **Rendition:** MediaMTX's ffmpeg republishes the source as the `1080` rendition (stream copy, no re-encoding). Viewers play it, or the original `url`, over HLS.
 4. **While live:** every 5 s the API reads MediaMTX's reader list, updates `viewers`/`peakViewers` and broadcasts `stream.viewers`.
 5. **Chat:** logged-in viewers post with `POST /streams/:id/chat`. Messages are stored in Postgres and pushed to everyone who joined that stream's chat on the WebSocket. The streamer and the moderators they appoint can delete messages and ban users, and the streamer can turn on slow mode.
 6. **End:** MediaMTX reports `offline`. The API saves a VOD (same id, title, peak viewers), deletes the live session and broadcasts `stream.ended`. The chat stays attached to the VOD id for replay.
@@ -844,9 +844,7 @@ GET /v1/streams?page=1&limit=20
       "viewers": 0,
       "url": "http://localhost:8888/live/8918071a-bcf3-4445-9a0e-f1b057c1d3ad/index.m3u8",
       "renditions": [
-        { "quality": "1080p", "url": "http://localhost:8888/watch/8918071a-bcf3-4445-9a0e-f1b057c1d3ad/1080/index.m3u8" },
-        { "quality": "720p", "url": "http://localhost:8888/watch/8918071a-bcf3-4445-9a0e-f1b057c1d3ad/720/index.m3u8" },
-        { "quality": "480p", "url": "http://localhost:8888/watch/8918071a-bcf3-4445-9a0e-f1b057c1d3ad/480/index.m3u8" }
+        { "quality": "1080p", "url": "http://localhost:8888/watch/8918071a-bcf3-4445-9a0e-f1b057c1d3ad/1080/index.m3u8" }
       ],
       "chatSlowModeSeconds": 0
     }
@@ -887,9 +885,7 @@ GET /v1/streams/97e495ba-4a54-47b0-be69-617820983d40
   "viewers": 0,
   "url": "http://localhost:8888/live/8918071a-bcf3-4445-9a0e-f1b057c1d3ad/index.m3u8",
   "renditions": [
-    { "quality": "1080p", "url": "http://localhost:8888/watch/8918071a-bcf3-4445-9a0e-f1b057c1d3ad/1080/index.m3u8" },
-    { "quality": "720p", "url": "http://localhost:8888/watch/8918071a-bcf3-4445-9a0e-f1b057c1d3ad/720/index.m3u8" },
-    { "quality": "480p", "url": "http://localhost:8888/watch/8918071a-bcf3-4445-9a0e-f1b057c1d3ad/480/index.m3u8" }
+    { "quality": "1080p", "url": "http://localhost:8888/watch/8918071a-bcf3-4445-9a0e-f1b057c1d3ad/1080/index.m3u8" }
   ],
   "chatSlowModeSeconds": 0
 }
@@ -1345,9 +1341,7 @@ A broadcast went live. `data` is the full live stream, the same shape as [`GET /
     "viewers": 0,
     "url": "http://localhost:8888/live/8918071a-bcf3-4445-9a0e-f1b057c1d3ad/index.m3u8",
     "renditions": [
-      { "quality": "1080p", "url": "http://localhost:8888/watch/8918071a-bcf3-4445-9a0e-f1b057c1d3ad/1080/index.m3u8" },
-      { "quality": "720p", "url": "http://localhost:8888/watch/8918071a-bcf3-4445-9a0e-f1b057c1d3ad/720/index.m3u8" },
-      { "quality": "480p", "url": "http://localhost:8888/watch/8918071a-bcf3-4445-9a0e-f1b057c1d3ad/480/index.m3u8" }
+      { "quality": "1080p", "url": "http://localhost:8888/watch/8918071a-bcf3-4445-9a0e-f1b057c1d3ad/1080/index.m3u8" }
     ],
     "chatSlowModeSeconds": 0
   }
@@ -1477,7 +1471,7 @@ The API uses the request's socket address. If the API runs behind a reverse prox
 The `authHTTPAddress` hook. MediaMTX calls it before **every** publish and read.
 
 - **`publish`:** allowed only if the path is `live/<stream settings id>` and the key matches that stream. The key is read from the query string (`?key=`). `?pass=` (password) and a Bearer token are also accepted, for WHIP/SRT clients.
-- **`publish` to `watch/…` from loopback** (`ip` 127.0.0.1 or ::1): allowed without a key. This is MediaMTX's own transcoder republishing renditions (`watch/<streamId>/1080|720|480`). The same publish from any other IP is rejected.
+- **`publish` to `watch/…` from loopback** (`ip` 127.0.0.1 or ::1): allowed without a key. This is MediaMTX's own transcoder republishing renditions (`watch/<streamId>/1080`). The same publish from any other IP is rejected.
 - **`read` and `playback`:** always allowed, since watching is public.
 - **Any other action** gets `403`. Exclude `api`, `metrics` and `pprof` from HTTP auth in MediaMTX.
 
@@ -1546,28 +1540,56 @@ path=live/8918071a-bcf3-4445-9a0e-f1b057c1d3ad
 
 ### MediaMTX setup
 
-A ready-to-use config is in [`deploy/mediamtx/`](deploy/mediamtx/). The essentials:
+A complete `mediamtx.yml` for MediaMTX 1.21, running on the same host as the API (API on port 8000). Only settings that differ from MediaMTX's defaults are shown:
 
 ```yaml
+# Every publish/read is checked by the API.
 authMethod: http
-authHTTPAddress: http://api:3000/v1/webhooks/mediamtx/auth
+authHTTPAddress: http://127.0.0.1:8000/v1/webhooks/mediamtx/auth
 authHTTPExclude:
   - action: api
   - action: metrics
   - action: pprof
 
+# Control API, polled by the API for viewer counts (MEDIAMTX_API_URL). Keep it private.
+api: yes
+apiAddress: 127.0.0.1:8088
+
+rtsp: yes
+rtspAddress: 127.0.0.1:8553   # internal only: used by the ffmpeg below
+rtmp: yes                     # encoders publish here (:1935)
+hls: yes
+hlsAddress: :8888             # viewers play here (HLS_BASE_URL)
+
 paths:
-  "~^live/[0-9a-f-]{36}$":
-    runOnOnline: curl -fsS -X POST http://api:3000/v1/webhooks/mediamtx/online -d path=$MTX_PATH
-    runOnOffline: curl -fsS -X POST http://api:3000/v1/webhooks/mediamtx/offline -d path=$MTX_PATH
+  ~^live/(.+)$:
+    # Republish the source as the 1080 rendition (stream copy, no re-encoding).
+    runOnAvailable: >
+      ffmpeg -rtsp_transport tcp -i rtsp://127.0.0.1:$RTSP_PORT/$MTX_PATH
+      -map 0:v -map 0:a? -c:v copy -c:a copy
+      -f rtsp -rtsp_transport tcp rtsp://127.0.0.1:$RTSP_PORT/watch/$G1/1080
+    runOnAvailableRestart: yes
+    # Broadcast live / stopped -> API starts / ends the live session.
+    runOnOnline: curl -fsS -X POST http://127.0.0.1:8000/v1/webhooks/mediamtx/online -d path=$MTX_PATH
+    runOnOffline: curl -fsS -X POST http://127.0.0.1:8000/v1/webhooks/mediamtx/offline -d path=$MTX_PATH
+
+  ~^watch/[^/]+/(1080)$:
 ```
 
-- Replace `http://api:3000/v1` with the API's address as seen from MediaMTX, and add MediaMTX's IP to `WEBHOOK_ALLOWED_IPS`.
-- **The official `bluenviron/mediamtx` image has no shell and no `curl`**, so `runOnOnline`/`runOnOffline` fail in it. Use [`deploy/mediamtx/Dockerfile`](deploy/mediamtx/Dockerfile): the same binary on Alpine, with `curl` installed.
-- MediaMTX 1.21 has no `runOnReady`/`runOnNotReady`; use `runOnOnline`/`runOnOffline` as shown.
-- **Viewer counts need MediaMTX's API** (`api: yes`) and the API's `MEDIAMTX_API_URL` pointing at it. Keep it private: `authHTTPExclude` lets anyone reach it without auth.
-- HLS players get a `302` to `…/index.m3u8?cookieCheck=1` first. That's MediaMTX's normal session redirect, and HLS players follow it.
-
+- **Addresses:** if the API runs elsewhere, replace `http://127.0.0.1:8000/v1` with its address as seen from MediaMTX, and add MediaMTX's IP to the API's `WEBHOOK_ALLOWED_IPS`.
+- **Renditions:** the `watch/…/(1080)` paths must match the API's `STREAM_RENDITIONS`. Its transcoder publishes are allowed without a key because they come from loopback.
+- **Requirements:** the host needs `ffmpeg` (transcoder) and `curl` (hooks).
+- **Docker:** the official `bluenviron/mediamtx` image has no shell, `curl` or `ffmpeg`, so the hooks fail in it. Build an image with them:
+  ```dockerfile
+  FROM alpine:3.22
+  RUN apk add --no-cache curl ffmpeg
+  COPY --from=bluenviron/mediamtx:1.21.3 /mediamtx /mediamtx
+  ENTRYPOINT ["/mediamtx"]
+  ```
+- **Hook names:** MediaMTX 1.21 has no `runOnReady`/`runOnNotReady`; use `runOnOnline`/`runOnOffline` as shown.
+- **Viewer counts** need `api: yes` and the API's `MEDIAMTX_API_URL` pointing at it. Keep that port private, since `authHTTPExclude` lets anyone reach it without auth.
+- **Redirect:** HLS players get a `302` to `…/index.m3u8?cookieCheck=1` first. That's MediaMTX's normal session redirect, and HLS players follow it.
+- **Config reloads:** MediaMTX reloads `mediamtx.yml` automatically when it changes.
 ---
 
 ## React web client
@@ -2699,7 +2721,7 @@ export function HlsPlayer({ src }: { src: string }) {
 
 #### Quality picker
 
-Each live stream has its original broadcast (`url`) and transcoded `renditions` (1080p, 720p, 480p).
+Each live stream has its original broadcast (`url`) and its `renditions` (currently just `1080p`, set by `STREAM_RENDITIONS`). The picker shows nothing to choose until more qualities are added.
 
 ```tsx
 // src/components/LivePlayer.tsx
@@ -2713,10 +2735,8 @@ export function LivePlayer({ stream }: { stream: LiveStream }) {
     { quality: 'Source', url: stream.url },
     ...stream.renditions,
   ];
-  // Default to 720p if available: a good balance for most connections.
-  const [url, setUrl] = useState(
-    stream.renditions.find((r) => r.quality === '720p')?.url ?? stream.url,
-  );
+  // Default to the first (highest) rendition; fall back to the original.
+  const [url, setUrl] = useState(stream.renditions[0]?.url ?? stream.url);
 
   return (
     <div>
@@ -2743,7 +2763,7 @@ return streams.map((s) => (
 ));
 ```
 
-Each quality is a separate stream on the media server, so hls.js can't switch quality automatically (no ABR). Switching reloads the player. Default to 720p and let users pick.
+Each quality is a separate stream on the media server, so hls.js can't switch quality automatically (no ABR). Switching reloads the player.
 
 #### Channel page (public)
 
@@ -3236,7 +3256,7 @@ Set in `.env` (see `.env.example`). The server won't start if any of these is mi
 | `HLS_BASE_URL` | `http://localhost:8888` | MediaMTX's public HLS address. Original = `<HLS_BASE_URL>/live/<id>/index.m3u8`; renditions = `<HLS_BASE_URL>/watch/<id>/<quality>/index.m3u8` |
 | `MEDIAMTX_API_URL` | `http://127.0.0.1:8088` | MediaMTX's control API (`apiAddress` in mediamtx.yml, with `api: yes`), polled for viewer counts. Don't expose it publicly: it's excluded from auth. |
 | `VIEWERS_POLL_SECONDS` | `5` | How often viewer counts are refreshed and `stream.viewers` is sent |
-| `STREAM_RENDITIONS` | `1080,720,480` | Qualities the MediaMTX transcoder publishes to `watch/<id>/<quality>`; returned as `renditions`, highest first |
+| `STREAM_RENDITIONS` | `1080` | Qualities the MediaMTX transcoder publishes to `watch/<id>/<quality>`; returned as `renditions`, highest first |
 | `WEBHOOK_ALLOWED_IPS` | `127.0.0.1,::1,10.0.0.0/8` | Comma-separated IPs or CIDR masks (IPv4 or IPv6) allowed to call `/webhooks/*`, i.e. MediaMTX's address. An invalid entry stops the server at startup. |
 | `CHAT_MESSAGE_INTERVAL_MS` | `1000` | Minimum time between two chat messages from the same user, in any chat. Applies to everyone (slow mode is extra, per channel, viewers only). |
 | `STREAM_PUBLISH_URL` | `rtmp://localhost:1935/live` | MediaMTX's public RTMP address plus `/live`, returned as `publishUrl`. It's saved on the user's stream settings when the key is generated, so changing it only affects keys generated afterwards. |

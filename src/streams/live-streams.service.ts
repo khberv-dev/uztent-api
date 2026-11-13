@@ -32,7 +32,7 @@ const LIVE_KEY = 'streams:live';
 @Injectable()
 export class LiveStreamsService {
   private readonly hlsBaseUrl: string;
-  /** Rendition heights, highest first, e.g. [1080, 720, 480]. */
+  /** Rendition heights, highest first, e.g. [1080]. */
   private readonly renditions: string[];
 
   constructor(

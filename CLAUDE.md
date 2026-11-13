@@ -33,7 +33,7 @@ Vitest runs with `globals: true`, and `vite-tsconfig-paths` resolves tsconfig pa
 - `DB_HOST`, `DB_PORT`, `DB_USERNAME`, `DB_PASSWORD`, `DB_NAME`
 - `JWT_ACCESS_SECRET`, `JWT_ACCESS_TTL` (seconds), `REFRESH_TOKEN_TTL_DAYS`
 - `GOOGLE_CLIENT_IDS`: comma-separated Google OAuth client IDs (web, iOS, Android); must not be empty
-- `REDIS_URL`; `HLS_BASE_URL`, the MediaMTX HLS root (original = `/live/<streamId>/index.m3u8`, renditions = `/watch/<streamId>/<quality>/index.m3u8`); `STREAM_RENDITIONS` (e.g. `1080,720,480`)
+- `REDIS_URL`; `HLS_BASE_URL`, the MediaMTX HLS root (original = `/live/<streamId>/index.m3u8`, renditions = `/watch/<streamId>/<quality>/index.m3u8`); `STREAM_RENDITIONS` (currently `1080`)
 - `STREAM_PUBLISH_URL`: the encoder's ingest server, saved on a user's `Stream` row when their key is generated
 - `MEDIAMTX_API_URL` (MediaMTX control API, needs `api: yes`) and `VIEWERS_POLL_SECONDS`
 - `WEBHOOK_ALLOWED_IPS`: comma-separated IPs or CIDR masks allowed to call `/webhooks/*`; an invalid entry fails at startup
@@ -54,11 +54,11 @@ Vitest runs with `globals: true`, and `vite-tsconfig-paths` resolves tsconfig pa
 - **Streams and VODs**: the word "stream" means two things here.
   - `Stream` entity (`streams` table, `StreamsService`): a user's **static** settings, one-to-one with `User`, holding `title`, `streamKey` and `publishUrl`. `POST /streams/me/key` upserts it on `userId`, which replaces the key and keeps `id`. The `id` is public: it's the MediaMTX path (`live/<id>`) and therefore the HLS URL. The encoder sends the secret as `?key=` (the `encoderStreamKey` getter).
   - `LiveStream` (`LiveStreamsService`): a **live session**, kept only in Redis, described below. There's no user endpoint to start or end one. MediaMTX (v1.21) calls `MediamtxWebhooksController`:
-    - `POST /webhooks/mediamtx/auth` (`authHTTPAddress`, MediaMTX's JSON) allows `read`/`playback`, and allows `publish` only when `path`=`live/<streamId>` and `query` `key=` matches. The one exception is publishes to `watch/…` from a loopback `ip`: the transcoder in the user's mediamtx.yml republishes 1080/720/480 renditions there.
+    - `POST /webhooks/mediamtx/auth` (`authHTTPAddress`, MediaMTX's JSON) allows `read`/`playback`, and allows `publish` only when `path`=`live/<streamId>` and `query` `key=` matches. The one exception is publishes to `watch/…` from a loopback `ip`: the ffmpeg in the user's mediamtx.yml republishes the source there as the `1080` rendition (stream copy).
     - `/online` and `/offline` (`runOnOnline`/`runOnOffline` curl, `-d path=$MTX_PATH`) find the stream by path, not by key, so replacing a key mid-broadcast is safe.
     - The routes are `@Public()` and guarded by `IpAllowlistGuard` (`src/common/guards`, `WEBHOOK_ALLOWED_IPS`, using `net.BlockList`) instead.
     - Bodies are typed `Record<string, unknown>` so the global `forbidNonWhitelisted` pipe skips them. Local `ValidationPipe({ whitelist, expectedType })` instances validate them and drop MediaMTX's extra fields.
-    - `deploy/mediamtx/` holds the config and a curl-enabled image; the official image is FROM scratch.
+    - The reference `mediamtx.yml` lives in `docs.md` ("MediaMTX setup"). The official image is FROM scratch (no curl or ffmpeg), so the hooks need a custom image or a native install.
     - `GET /streams/:idOrUsername` is `@Public()` (channel pages). A UUID means a live stream id; anything else is a username, and usernames can't contain `-`. By username it returns 404 `User not found` vs `User is not live`, and the React client tells them apart by the message.
     - `start()` is idempotent per user (a reconnect returns the existing session), and `end()` returns `null` when the user isn't live.
   - Live-stream playback URLs (`url` + `renditions`) aren't stored. `LiveStreamsService.toLiveStream` builds them on every read from the stored `streamId`, so `HLS_BASE_URL`/`STREAM_RENDITIONS` changes apply to sessions that are already live.
