@@ -36,6 +36,13 @@ export class Stream {
   @Column({ type: 'int', default: 0 })
   chatSlowModeSeconds: number;
 
+  /**
+   * Users following this stream's owner. Changed with each follow / unfollow;
+   * recomputed from `follows` when the key is generated.
+   */
+  @Column({ type: 'int', default: 0 })
+  followersCount: number;
+
   /** Secret. Only ever returned to the owner. */
   @Column({ unique: true })
   streamKey: string;

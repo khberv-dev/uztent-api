@@ -58,6 +58,13 @@ export class StreamsService {
       },
       { conflictPaths: ['userId'] },
     );
+    // Follows made before the row existed weren't counted on it.
+    await this.streams.query(
+      `UPDATE streams SET followers_count =
+         (SELECT COUNT(*) FROM follows WHERE following_id = $1)
+       WHERE user_id = $1`,
+      [userId],
+    );
     return this.getByUser(userId);
   }
 

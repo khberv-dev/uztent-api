@@ -65,6 +65,11 @@ The lifecycle of a broadcast:
 | GET | `/users/me` | Bearer | Get the current user's profile |
 | PATCH | `/users/me` | Bearer | Update first name, last name or username |
 | GET | `/users/username-availability?username=…` | Bearer | Check whether a username is free |
+| POST | `/users/:userId/follow` | Bearer | Follow a user |
+| DELETE | `/users/:userId/follow` | Bearer | Unfollow a user |
+| GET | `/users/:userId/follow` | **Public** (token optional) | Followers count, and whether you follow them |
+| GET | `/users/:userId/followers` | **Public** | Who follows a user |
+| GET | `/users/:userId/following` | **Public** | Whom a user follows |
 | GET | `/streams/me` | Bearer | Get your stream settings: title, stream key, publish URL |
 | PATCH | `/streams/me` | Bearer | Change your stream title or chat slow mode |
 | POST | `/streams/me/key` | Bearer | Generate your stream key, or replace it with a new one |
@@ -235,6 +240,14 @@ Every live stream has a chat. It's stored in Postgres under the **live stream id
   - Making a banned user a moderator lifts the ban.
 - `GET /streams/:id/chat/me` tells a client the user's role, ban status and the current slow mode, so it can show the right controls.
 - Deleting a VOD deletes its chat. Deleting a user deletes their messages and bans.
+
+### Follows
+
+Any signed-in user can follow any other user (not themselves). A follow is one `follows` row per (follower, followed) pair.
+
+- **Counter:** the followed user's count is stored on their **stream row** as `followersCount`. Following increments it and unfollowing decrements it, in the same transaction as the row change. Both are idempotent: following twice or unfollowing someone you don't follow changes nothing.
+- **Users without a stream row** (they never generated a key) can still be followed. Their count is computed from `follows`, and copied onto the row when it's created by `POST /streams/me/key`.
+- `GET /users/:userId/follow` is the cheap read for a channel page: `followersCount` plus, with a token, whether the caller follows.
 
 ### Donations
 
@@ -429,6 +442,13 @@ A logged-out visitor can donate the same way; the donation is anonymous (`donorN
 2. A **Donations** tab pages through `GET /monetization/donations`, and can filter by stream (`?streamId=`), date range, or status (e.g. `?status=expired` to see abandoned payments).
 3. A **Streams** tab shows `GET /monetization/streams`: how much each broadcast earned, with the live one first.
 4. `GET /monetization/top-donors?from=…` lists the biggest supporters of the month. Each entry has `donorId`, so the streamer can thank them or make them a chat moderator.
+
+### 24. Viewer follows a streamer
+
+1. The channel page loads `GET /users/:userId/follow` (with the token if signed in) and shows **Follow** or **Following** with the count.
+2. Clicking **Follow** sends `POST /users/:userId/follow`; the response has the new `following` and `followersCount`, so the button updates without another request. **Unfollow** is `DELETE` on the same URL.
+3. The profile page lists `GET /users/:userId/followers` and `GET /users/:userId/following`.
+4. The streamer sees their count in `GET /streams/me` (`followersCount`).
 
 ---
 
@@ -794,6 +814,110 @@ curl -G http://localhost:8000/v1/users/username-availability \
 
 ---
 
+### POST /users/:userId/follow
+
+**Bearer.** Follow a user. Idempotent: following again returns the same result.
+
+```http
+POST /v1/users/0f8fad5b-d9cb-469f-a165-70867728950e/follow
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+```
+
+**201 Created**
+
+```json
+{ "following": true, "followersCount": 129 }
+```
+
+**Errors**
+
+| Status | `message` | When |
+|---|---|---|
+| 400 | `You can't follow yourself` | `:userId` is the caller |
+| 400 | `Validation failed (uuid is expected)` | `:userId` isn't a UUID |
+| 401 | `Unauthorized` | No or invalid token |
+| 404 | `User not found` | No such user |
+
+---
+
+### DELETE /users/:userId/follow
+
+**Bearer.** Unfollow. Idempotent: unfollowing someone you don't follow returns the same result.
+
+```http
+DELETE /v1/users/0f8fad5b-d9cb-469f-a165-70867728950e/follow
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+```
+
+**200 OK**
+
+```json
+{ "following": false, "followersCount": 128 }
+```
+
+**Errors:** `400` (not a UUID), `401`, `404` `User not found`.
+
+---
+
+### GET /users/:userId/follow
+
+**Public; access token optional.** The user's followers count, and whether the caller follows them (`false` without a token, and on your own profile).
+
+```http
+GET /v1/users/0f8fad5b-d9cb-469f-a165-70867728950e/follow
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...   ← optional
+```
+
+**200 OK**
+
+```json
+{ "following": true, "followersCount": 129 }
+```
+
+**Errors:** `400` (not a UUID), `404` `User not found`.
+
+---
+
+### GET /users/:userId/followers
+
+**Public.** Users following `:userId`, newest follow first. [Paginated](#conventions).
+
+```http
+GET /v1/users/0f8fad5b-d9cb-469f-a165-70867728950e/followers?page=1&limit=20
+```
+
+**200 OK**
+
+```json
+{
+  "items": [
+    {
+      "userId": "6f1e2d3c-4b5a-4968-8776-5a4b3c2d1e0f",
+      "username": "don_donor",
+      "firstName": "Donor",
+      "since": "2026-11-13T13:23:03.465Z"
+    }
+  ],
+  "total": 129,
+  "page": 1,
+  "limit": 20
+}
+```
+
+`since` is when they followed. Last names aren't included: lists are public, and like chat they show the username, or the first name when there's none. **Errors:** `400` (not a UUID or bad paging), `404` `User not found`.
+
+---
+
+### GET /users/:userId/following
+
+**Public.** Users that `:userId` follows, newest first. Same shape as [`/followers`](#get-usersuseridfollowers); `since` is when `:userId` followed them.
+
+```http
+GET /v1/users/6f1e2d3c-4b5a-4968-8776-5a4b3c2d1e0f/following
+```
+
+---
+
 ### GET /streams/me
 
 **Bearer.** The caller's stream settings: title, stream key, encoder stream key and publish URL.
@@ -810,6 +934,7 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
   "id": "8918071a-bcf3-4445-9a0e-f1b057c1d3ad",
   "title": "Friday night ranked",
   "chatSlowModeSeconds": 0,
+  "followersCount": 128,
   "streamKey": "sk_ZDfWm48KMkwbM1xnOlGe0Dsn36A_yY06",
   "publishUrl": "rtmp://localhost:1935/live",
   "createdAt": "2026-11-13T05:38:45.521Z",
@@ -878,6 +1003,7 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
   "id": "8918071a-bcf3-4445-9a0e-f1b057c1d3ad",
   "title": "Friday night ranked",
   "chatSlowModeSeconds": 0,
+  "followersCount": 128,
   "streamKey": "sk_X3ZOxjLmDS7rjswmX7MLhqAg4SK8y_yM",
   "publishUrl": "rtmp://localhost:1935/live",
   "createdAt": "2026-11-13T05:38:45.521Z",
@@ -3895,6 +4021,7 @@ Deploy the `public/` folder next to `dist/`. Anything put there is publicly down
 - **Automatic schema changes:** `synchronize` can drop columns, and their data, when entity properties are renamed or removed. Don't run it against a production database without a backup.
 - **`stream.*` events are broadcast to everyone:** every client gets `stream.viewers` for all live streams. That's fine for a moderate number of concurrent streams (chat events already use per-stream rooms).
 - **Missed events aren't replayed:** a client that was disconnected must reload over REST (the React hooks do this on reconnect).
+- **Follower counts after account deletion:** deleting a user removes their follows (cascade) but doesn't decrement the counters on the users they followed. There's no account-deletion endpoint yet; when one is added, it should decrement those counters (or regenerating a key resyncs a streamer's count).
 - **Chat limitations:**
   - There's no word filter and no temporary timeouts (bans are until lifted).
   - `senderRole` is a snapshot: messages sent before a promotion or demotion keep their old badge.
