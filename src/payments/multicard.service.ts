@@ -38,13 +38,13 @@ export interface MulticardCallback {
   receipt_url?: string;
 }
 
-/** A card binding session (docs: "Привязка карт (форма)"). */
-export interface MulticardCardBinding {
-  /** active = bound and usable; draft = the user hasn't finished; deleted. */
+/** A bound card (docs: "Привязка карт (API)"). */
+export interface MulticardCard {
+  /** draft = waiting for the SMS code; active = usable. */
   status: string;
-  cardToken: string | null;
+  cardToken: string;
   /** Masked, e.g. 986027******1519. */
-  cardPan: string | null;
+  cardPan: string;
   /** uzcard, humo, visa, mastercard, unionpay. */
   ps: string | null;
 }
@@ -67,6 +67,8 @@ export class MulticardRejection extends BadGatewayException {
   constructor(
     readonly code: string,
     readonly details: string,
+    /** Multicard's HTTP status (e.g. 429 when an SMS was just sent). */
+    readonly httpStatus: number,
   ) {
     super('Payment provider rejected the request');
   }
@@ -81,7 +83,7 @@ interface MulticardResponse<T> {
 /**
  * Multicard payment gateway (docs.multicard.uz). POST /auth → token, then:
  * - hosted invoice: POST /payment/invoice → checkout_url, signed callback;
- * - card binding (form): POST /payment/card/bind → form_url, GET to check;
+ * - card binding (API, PCI DSS): POST /payment/card → SMS, PUT to confirm;
  * - token payment: POST /payment, then PUT /payment/:uuid (empty or OTP).
  */
 @Injectable()
@@ -128,42 +130,33 @@ export class MulticardService {
   }
 
   /**
-   * Starts a card binding session (15 min). The user enters the card on
-   * `formUrl`; Multicard then calls `callbackUrl` with `payer_id` = sessionId.
+   * Card binding via API (PCI DSS partners only): sends the card data and
+   * makes Multicard text a code to the card's phone. Returns a draft token.
    */
-  async createCardBinding(params: {
+  async addCard(params: {
+    pan: string;
+    /** YYMM. */
+    expiry: string;
     phone: string;
-    redirectUrl: string;
-    redirectDeclineUrl: string;
-    callbackUrl: string;
-  }): Promise<{ sessionId: string; formUrl: string }> {
-    const data = await this.request<{ session_id: string; form_url: string }>(
-      'POST',
-      '/payment/card/bind',
-      {
-        store_id: Number(this.storeId),
-        phone: params.phone,
-        redirect_url: params.redirectUrl,
-        redirect_decline_url: params.redirectDeclineUrl,
-        callback_url: params.callbackUrl,
-      },
+  }): Promise<MulticardCard> {
+    return toCard(
+      await this.request<RawCard>('POST', '/payment/card', {
+        pan: params.pan,
+        expiry: params.expiry,
+        user_phone: params.phone,
+      }),
     );
-    return { sessionId: data.session_id, formUrl: data.form_url };
   }
 
-  async getCardBinding(sessionId: string): Promise<MulticardCardBinding> {
-    const data = await this.request<{
-      status?: string;
-      card_token?: string;
-      card_pan?: string;
-      ps?: string;
-    }>('GET', `/payment/card/bind/${encodeURIComponent(sessionId)}`);
-    return {
-      status: data.status ?? 'draft',
-      cardToken: data.card_token ?? null,
-      cardPan: data.card_pan ?? null,
-      ps: data.ps ?? null,
-    };
+  /** Confirms a draft card with the SMS code; `status` becomes `active`. */
+  async confirmCard(cardToken: string, otp: string): Promise<MulticardCard> {
+    return toCard(
+      await this.request<RawCard>(
+        'PUT',
+        `/payment/card/${encodeURIComponent(cardToken)}`,
+        { otp },
+      ),
+    );
   }
 
   /** Revokes a card token. */
@@ -261,7 +254,7 @@ export class MulticardService {
     try {
       response = await fetch(this.apiUrl + path, init);
     } catch (error) {
-      this.logger.error(`${method} ${path} failed: ${String(error)}`);
+      this.logger.error(`${method} ${redact(path)} failed: ${String(error)}`);
       throw new BadGatewayException('Payment provider is unavailable');
     }
 
@@ -278,9 +271,13 @@ export class MulticardService {
       const error = json?.error
         ? `${json.error.code}: ${json.error.details}`
         : `HTTP ${response.status}`;
-      this.logger.error(`${method} ${path} rejected: ${error}`);
+      this.logger.error(`${method} ${redact(path)} rejected: ${error}`);
       if (json?.error) {
-        throw new MulticardRejection(json.error.code, json.error.details);
+        throw new MulticardRejection(
+          json.error.code,
+          json.error.details,
+          response.status,
+        );
       }
       throw new BadGatewayException('Payment provider rejected the request');
     }
@@ -325,6 +322,30 @@ export class MulticardService {
     this.token = { value: json.token, expiresAt: parseExpiry(json.expiry) };
     return json.token;
   }
+}
+
+/** Card tokens charge cards: keep them out of logs. */
+function redact(path: string): string {
+  return path.replace(
+    /^\/payment\/card\/(?!check\/)[^/]+/,
+    '/payment/card/***',
+  );
+}
+
+interface RawCard {
+  status: string;
+  card_token: string;
+  card_pan: string;
+  ps?: string | null;
+}
+
+function toCard(raw: RawCard): MulticardCard {
+  return {
+    status: raw.status,
+    cardToken: raw.card_token,
+    cardPan: raw.card_pan,
+    ps: raw.ps ?? null,
+  };
 }
 
 interface RawPayment {

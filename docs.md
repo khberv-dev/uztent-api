@@ -80,8 +80,8 @@ The lifecycle of a broadcast:
 | GET | `/donations/:id` | **Public** | One donation's status (for the return page) |
 | POST | `/donations/:id/confirm` | Bearer | Confirm a card donation with the SMS code (`otpRequired: true`) |
 | GET | `/payments/cards` | Bearer | Your saved cards |
-| POST | `/payments/cards` | Bearer | Start binding a card: returns Multicard's card form |
-| GET | `/payments/cards/bind/:bindId` | Bearer | Binding status (poll after the form) |
+| POST | `/payments/cards` | Bearer | Add a card (number, expiry, phone): Multicard texts a code |
+| POST | `/payments/cards/bind/:bindId/confirm` | Bearer | Confirm the card with the SMS code: the card is saved |
 | DELETE | `/payments/cards/:id` | Bearer | Remove a saved card |
 | GET | `/monetization/summary` | Bearer | Your earnings: all time, today, 7 / 30 days, average, largest |
 | GET | `/monetization/donations` | Bearer | Donations you received, filtered by status, stream, dates |
@@ -96,7 +96,6 @@ The lifecycle of a broadcast:
 | POST | `/webhooks/mediamtx/online` | IP allowlist | MediaMTX: a broadcast went live |
 | POST | `/webhooks/mediamtx/offline` | IP allowlist | MediaMTX: a broadcast ended |
 | POST | `/webhooks/multicard` | Signed (md5) | Multicard: a donation was paid |
-| POST | `/webhooks/multicard/cards` | Verified via Multicard API | Multicard: a card was bound |
 | GET | `/streams/:id/chat` | **Public** | Chat history of a live stream or VOD |
 | POST | `/streams/:id/chat` | Bearer | Send a chat message (stream must be live) |
 | GET | `/streams/:id/chat/me` | Bearer | Your role in this chat, ban status, slow mode |
@@ -296,13 +295,13 @@ Payment page:
 
 ### Saved cards
 
-A signed-in user can bind Uzcard, Humo, Visa or Mastercard cards through **Multicard's card form**: the card number is typed on Multicard's page, and the API only stores Multicard's **card token** (never returned) and the masked number.
+A signed-in user can save Uzcard and Humo cards in the app's own form. The API uses Multicard's **card binding via API** ("Привязка карт (API)"), which Multicard allows **only for partners with a PCI DSS certificate**: the card number and expiry pass through our API to Multicard. They're never stored, logged or returned. The API keeps only Multicard's **card token** (never returned) and the masked number.
 
-**Binding:**
-1. `POST /payments/cards { phone }` (the card's SMS phone, `998XXXXXXXXX`) returns `bindId` and `formUrl`. Open `formUrl` (redirect or WebView). The form session lives 15 minutes.
-2. The user enters the card, and Multicard sends them to `CARD_BIND_RETURN_URL?bindId=<id>&result=success|declined`.
-3. Multicard calls `POST /webhooks/multicard/cards`. The callback isn't signed, so the API only uses it to find the session and then asks Multicard's API for the card. The client also polls `GET /payments/cards/bind/:bindId`; whichever comes first saves the card.
-4. At most 10 cards per user. `DELETE /payments/cards/:id` revokes the token at Multicard and removes the card; past donations keep their history.
+**Adding a card:**
+1. `POST /payments/cards { pan, expiry: "MM/YY", phone }`. The API sends the card to Multicard, which texts a code to the card's SMS-informing phone. The response has `bindId`, the masked number and the payment system.
+2. `POST /payments/cards/bind/:bindId/confirm { otp }`. Multicard activates the card and the API saves it. A wrong code can be retried up to 5 times within 10 minutes; after that, start again.
+3. Limits: at most 10 cards per user, and 5 add attempts (SMS sends) per user per 10 minutes. Multicard itself refuses a second SMS for the same card within about a minute (429).
+4. `DELETE /payments/cards/:id` revokes the token at Multicard and removes the card; past donations keep their history.
 
 **Paying with a card:** `POST /streams/:idOrUsername/donations { amount, cardId, … }`.
 1. The API creates a Multicard payment with the card token (nothing is debited yet).
@@ -483,8 +482,8 @@ A logged-out visitor can donate the same way; the donation is anonymous (`donorN
 
 ### 25. Viewer saves a card and donates in one click
 
-1. In settings, the viewer clicks **Add card** and types their phone. The app sends `POST /payments/cards { "phone": "998901234567" }` and opens `formUrl`.
-2. After the form, Multicard sends them back to `/settings/cards?bindId=…&result=success`. The page polls `GET /payments/cards/bind/:bindId` until `status` is `active`.
+1. In settings, the viewer clicks **Add card** and fills in the number, expiry and phone. The app sends `POST /payments/cards { "pan": "8600…", "expiry": "06/28", "phone": "998901234567" }` and shows "We sent a code to the card's phone".
+2. The viewer types the code. The app sends `POST /payments/cards/bind/:bindId/confirm { "otp": "123456" }` and gets the saved card (masked number).
 3. On a stream, the donate form lists `GET /payments/cards` and a **Pay on Multicard's page** option. With a card selected, it sends `POST /streams/aziz_k/donations { "amount": 20000, "cardId": "…" }`.
 4. **201** with `status: "paid"`: done, and the alert is already on stream. With `otpRequired: true`, the form asks for the SMS code and sends `POST /donations/:id/confirm`.
 5. **402**: show "The card was declined" and let the donor pick another card or the payment page.
@@ -1629,65 +1628,77 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
 
 ### POST /payments/cards
 
-**Bearer.** Starts binding a card. Open `formUrl` (redirect or WebView); the user enters the card there. Afterwards Multicard sends them to `CARD_BIND_RETURN_URL?bindId=<bindId>&result=success` (or `result=declined`).
+**Bearer.** Step 1 of adding a card: sends the card to Multicard, which texts a confirmation code to the card's phone. Uzcard and Humo. The card data is passed through to Multicard and **never stored or logged**. Serve the API over HTTPS only.
+
+| Field | Type | Rules |
+|---|---|---|
+| `pan` | string | 16-digit card number; spaces and dashes are ignored |
+| `expiry` | string | `MM/YY` as printed on the card; must not have passed |
+| `phone` | string | The card's SMS-informing phone, `998XXXXXXXXX` (spaces ignored). Required by Multicard for Humo. |
 
 ```http
 POST /v1/payments/cards
 Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
 Content-Type: application/json
 
-{ "phone": "998901234567" }
+{ "pan": "9860 2701 2345 1519", "expiry": "06/28", "phone": "998901234567" }
 ```
-
-`phone`: the phone number the card sends SMS to, `998XXXXXXXXX` (required by Multicard for Humo cards; it isn't stored).
 
 **201 Created**
 
 ```json
 {
-  "bindId": "4ceac41b-d657-4f66-8905-fcda41a5313d",
-  "formUrl": "https://dev-checkout.multicard.uz/card/bd8729bf6d3a4",
-  "expiresAt": "2026-11-13T17:01:02.704Z"
+  "bindId": "113ad9c3-9f57-4dc1-bbe1-3beb76996430",
+  "cardPan": "986027******1519",
+  "ps": "humo",
+  "expiresAt": "2026-11-13T19:14:10.140Z"
 }
 ```
 
+Enter the code before `expiresAt` (10 minutes).
+
 | Status | `message` | When |
 |---|---|---|
-| 400 | `["phone must be in the format 998XXXXXXXXX"]` | Format |
+| 400 | `["pan must be a 16-digit card number"]` / `["expiry must be MM/YY"]` / `["phone must be in the format 998XXXXXXXXX"]` | Format |
+| 400 | `The card has expired` | `expiry` is in the past |
 | 400 | `You can link at most 10 cards` | Limit reached |
+| 400 | `The card was rejected` + `reason` (e.g. `ERROR_CARD_NOT_FOUND`) | Multicard refused: wrong number or expiry, no SMS informing, … |
+| 429 | `A code was sent recently, wait a minute and try again` | Multicard's resend limit for this card |
+| 429 | `Too many attempts to add a card, try again later` | More than 5 adds per 10 minutes |
 | 502 | `Payment provider is unavailable` / `Payment provider rejected the request` | Multicard error |
 
 ---
 
-### GET /payments/cards/bind/:bindId
+### POST /payments/cards/bind/:bindId/confirm
 
-**Bearer.** Binding status. Poll it after the user returns from the form (every 1–2 s, for up to ~30 s).
+**Bearer.** Step 2: the SMS code. Saves and returns the card.
 
 ```http
-GET /v1/payments/cards/bind/4ceac41b-d657-4f66-8905-fcda41a5313d
+POST /v1/payments/cards/bind/113ad9c3-9f57-4dc1-bbe1-3beb76996430/confirm
 Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+Content-Type: application/json
+
+{ "otp": "123456" }
 ```
 
-**200 OK**
+**201 Created**
 
 ```json
 {
-  "status": "active",
-  "card": {
-    "id": "0547bcfb-23c0-451d-8dbd-cd47d867d258",
-    "cardPan": "986027******1519",
-    "ps": "humo",
-    "createdAt": "2026-11-13T16:46:02.726Z"
-  }
+  "id": "0e28b6ba-4fa2-4be7-a585-0a5bdc78ebaf",
+  "cardPan": "986027******1519",
+  "ps": "humo",
+  "createdAt": "2026-11-13T19:04:10.153Z"
 }
 ```
 
-`status`: `pending` (form not finished, `card: null`), `active` (saved), `deleted`.
-
 | Status | `message` | When |
 |---|---|---|
-| 404 | `Card binding not found or expired` | Unknown, someone else's, or older than 20 minutes |
+| 400 | `["otp must be 4 to 8 digits"]` | Format |
+| 400 | `Wrong or expired confirmation code` | Try again (up to 5 times) |
+| 404 | `Card binding not found or expired` | Unknown, someone else's, already confirmed, or older than 10 minutes |
 | 409 | `This card is linked to another account` | The same card is already saved by another user |
+| 429 | `Too many wrong codes. Add the card again` | 6th attempt; the binding is discarded |
 
 ---
 
@@ -2324,19 +2335,19 @@ paths:
 
 ## Multicard integration (donations)
 
-Donations use two Multicard flows ([docs.multicard.uz](https://docs.multicard.uz)): the **hosted invoice** (the donor pays on Multicard's page) and **card binding (form) + payment by card token** (the API charges a saved card). Card binding through the form doesn't need a PCI DSS certificate.
+Donations use two Multicard flows ([docs.multicard.uz](https://docs.multicard.uz)): the **hosted invoice** (the donor pays on Multicard's page) and **card binding via API + payment by card token** (the API charges a saved card). Binding via API requires a **PCI DSS certificate**: card numbers pass through our API.
 
 | Step | Multicard API | Notes |
 |---|---|---|
 | Token | `POST /auth { application_id, secret }` | JWT, cached until shortly before `expiry` (GMT+5). A `401` triggers a new token and one retry. |
 | Invoice | `POST /payment/invoice` | `store_id`, `amount` (tiyin), `invoice_id` = donation id, `callback_url`, `return_url` (`DONATION_RETURN_URL?donationId=…`), `lang`, `ttl` (no `ofd` fiscal data). Returns `uuid` and `checkout_url` (`app.rhmt.uz`). |
-| Bind card | `POST /payment/card/bind` | `store_id`, `phone`, `redirect_url` / `redirect_decline_url` (`CARD_BIND_RETURN_URL?bindId=…&result=…`), `callback_url` (`MULTICARD_CARD_CALLBACK_URL`). Returns `session_id` and `form_url`. |
-| Bind status | `GET /payment/card/bind/:session_id` | `status` (`active` / `draft` / `deleted`), `card_token`, `card_pan`, `ps`. The source of truth for a binding. |
+| Add card | `POST /payment/card` | `pan`, `expiry` (**YYMM**; the API converts from MM/YY), `user_phone`. Multicard texts a code; returns a `draft` `card_token`, `card_pan`, `ps`. **PCI DSS partners only.** |
+| Confirm card | `PUT /payment/card/:card_token` | `{ otp }` → `status: active`. `ERROR_WRONG_OTP` for a wrong or expired code. |
 | Remove card | `DELETE /payment/card/:card_token` | `ERROR_CARD_NOT_FOUND` is ignored (already gone). |
 | Card payment | `POST /payment` | `card.token`, `amount` (tiyin), `store_id`, `invoice_id` = donation id, `callback_url`, `device_details { ip, user_agent }` of the donor. Returns `uuid` and `otp_hash` (null = no SMS code needed). |
 | Confirm | `PUT /payment/:uuid` | Empty body, or `{ otp, debit_available: false }`. `ERROR_WRONG_OTP` → retry; `ERROR_DEBIT_UNKNOWN` / `ERROR_CALLBACK_TIMEOUT` → check status. |
 | Payment status | `GET /payment/:uuid` | `success` → paid; `error` / `revert` → failed; anything else is still in progress. |
-| Callbacks | → `POST /v1/webhooks/multicard`, `POST /v1/webhooks/multicard/cards` | See below |
+| Callback | → `POST /v1/webhooks/multicard` | See below |
 
 ### POST /webhooks/multicard
 
@@ -2368,27 +2379,12 @@ Called by Multicard after a successful payment (`callback_url`). Always answers 
 
 Anything but `success: true` makes Multicard cancel and refund that payment. A donation is marked paid with a conditional update, so concurrent or repeated callbacks produce exactly one `donation.received`.
 
-### POST /webhooks/multicard/cards
-
-Called by Multicard when a user finishes the card form (`callback_url` of the binding). The body isn't signed, so the API only reads `payer_id` (= `session_id`), finds the binding, and fetches the card from `GET /payment/card/bind/:session_id`. It always answers HTTP 200 `{ "success": true }`; otherwise Multicard retries every 60 s, 5 times.
-
-```json
-{
-  "payer_id": "688470c8060af",
-  "card_pan": "986027******1519",
-  "card_token": "6225f3c93f7a880142782fa4",
-  "ps": "humo",
-  "status": "active",
-  "added_on": "2025-03-17 03:19:12"
-}
-```
-
 ### Multicard setup
 
 1. Get `application_id`, `secret` and `store_id` from Multicard, and set `MULTICARD_*` in `.env`. Use `https://dev-mesh.multicard.uz` while testing (test card `8600 5333 6409 8829`, expiry `28/06`, OTP `111111`), then `https://mesh.multicard.uz`.
 2. Set `MULTICARD_CALLBACK_URL` to the API's **public** HTTPS URL + `/v1/webhooks/multicard`. Multicard calls it from `195.158.26.90`.
 3. Point `DONATION_RETURN_URL` at the web app page that shows the result.
-4. For saved cards: set `MULTICARD_CARD_CALLBACK_URL` to the public URL + `/v1/webhooks/multicard/cards`, and `CARD_BIND_RETURN_URL` to the web app page that finishes binding. Ask Multicard whether card payments on your store need an SMS code (`otp_required`); the API supports both.
+4. For saved cards: Multicard must enable card binding via API for your application, which requires a PCI DSS certificate. Ask too whether card payments on your store need an SMS code (`otp_required`); the API supports both. Serve the API over HTTPS only, and keep request-body logging off on any proxy in front of it (card numbers pass through).
 
 ---
 
@@ -4266,8 +4262,6 @@ Set in `.env` (see `.env.example`). The server won't start if any of these is mi
 | `DONATION_INVOICE_TTL_SECONDS` | `1800` | Unpaid invoices are cancelled after this |
 | `DONATION_INVOICES_PER_MINUTE` | `5` | Invoice creation limit per user (or IP for guests) |
 | `DONATION_RETURN_URL` | `http://localhost:5173/donations/complete` | Where Multicard sends the donor after paying (`?donationId=` appended) |
-| `MULTICARD_CARD_CALLBACK_URL` | `https://api.example.uz/v1/webhooks/multicard/cards` | Public URL Multicard calls when a card is bound |
-| `CARD_BIND_RETURN_URL` | `http://localhost:5173/settings/cards` | Where Multicard sends the user after the card form (`?bindId=…&result=success\|declined` appended) |
 | `STREAM_PUBLISH_URL` | `rtmp://localhost:1935/live` | MediaMTX's public RTMP address plus `/live`, returned as `publishUrl`. It's saved on the user's stream settings when the key is generated, so changing it only affects keys generated afterwards. |
 
 The database schema is created and updated automatically from the entities at startup (TypeORM `synchronize`). There are no migrations.
@@ -4313,5 +4307,5 @@ Deploy the `public/` folder next to `dist/`. Anything put there is publicly down
   - The callback is trusted by its md5 signature only; its source IP (`195.158.26.90`) isn't enforced.
   - No refunds, streamer payouts or earnings report in the API yet. Money settles to the Multicard store, and payouts to streamers are handled outside the app.
   - A donation that Multicard pays after `expiresAt` (e.g. a late callback) is still accepted and announced.
-  - Card binding and card payments are also tested only against the mock. Multicard's docs don't show a full PaymentModel for the token-payment response, so check the sandbox for the exact `status` after confirmation.
+  - Card binding (API) and card payments are also tested only against the mock, and binding via API needs Multicard to enable it (PCI DSS). Multicard's docs don't show a full PaymentModel for the token-payment response, so check the sandbox for the exact `status` after confirmation.
   - Deleting a user account removes their saved cards in the database, but doesn't revoke the tokens at Multicard (there's no account deletion endpoint yet).
