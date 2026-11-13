@@ -38,6 +38,40 @@ export interface MulticardCallback {
   receipt_url?: string;
 }
 
+/** A card binding session (docs: "Привязка карт (форма)"). */
+export interface MulticardCardBinding {
+  /** active = bound and usable; draft = the user hasn't finished; deleted. */
+  status: string;
+  cardToken: string | null;
+  /** Masked, e.g. 986027******1519. */
+  cardPan: string | null;
+  /** uzcard, humo, visa, mastercard, unionpay. */
+  ps: string | null;
+}
+
+/** The parts of Multicard's PaymentModel we use. */
+export interface MulticardPayment {
+  uuid: string;
+  /** draft, progress, billing, hold, success, error, revert. */
+  status: string;
+  /** Not null when the payment must be confirmed with an SMS code. */
+  otpHash: string | null;
+  ps: string | null;
+  receiptUrl: string | null;
+  /** "YYYY-mm-dd H:i:s", GMT+5. */
+  paymentTime: string | null;
+}
+
+/** Multicard answered with `success: false` (e.g. a declined card). */
+export class MulticardRejection extends BadGatewayException {
+  constructor(
+    readonly code: string,
+    readonly details: string,
+  ) {
+    super('Payment provider rejected the request');
+  }
+}
+
 interface MulticardResponse<T> {
   success: boolean;
   data?: T;
@@ -45,9 +79,10 @@ interface MulticardResponse<T> {
 }
 
 /**
- * Multicard payment gateway (docs.multicard.uz): hosted invoice strategy.
- * POST /auth → token, POST /payment/invoice → checkout_url, then a signed
- * success callback to our callback_url.
+ * Multicard payment gateway (docs.multicard.uz). POST /auth → token, then:
+ * - hosted invoice: POST /payment/invoice → checkout_url, signed callback;
+ * - card binding (form): POST /payment/card/bind → form_url, GET to check;
+ * - token payment: POST /payment, then PUT /payment/:uuid (empty or OTP).
  */
 @Injectable()
 export class MulticardService {
@@ -92,6 +127,98 @@ export class MulticardService {
     };
   }
 
+  /**
+   * Starts a card binding session (15 min). The user enters the card on
+   * `formUrl`; Multicard then calls `callbackUrl` with `payer_id` = sessionId.
+   */
+  async createCardBinding(params: {
+    phone: string;
+    redirectUrl: string;
+    redirectDeclineUrl: string;
+    callbackUrl: string;
+  }): Promise<{ sessionId: string; formUrl: string }> {
+    const data = await this.request<{ session_id: string; form_url: string }>(
+      'POST',
+      '/payment/card/bind',
+      {
+        store_id: Number(this.storeId),
+        phone: params.phone,
+        redirect_url: params.redirectUrl,
+        redirect_decline_url: params.redirectDeclineUrl,
+        callback_url: params.callbackUrl,
+      },
+    );
+    return { sessionId: data.session_id, formUrl: data.form_url };
+  }
+
+  async getCardBinding(sessionId: string): Promise<MulticardCardBinding> {
+    const data = await this.request<{
+      status?: string;
+      card_token?: string;
+      card_pan?: string;
+      ps?: string;
+    }>('GET', `/payment/card/bind/${encodeURIComponent(sessionId)}`);
+    return {
+      status: data.status ?? 'draft',
+      cardToken: data.card_token ?? null,
+      cardPan: data.card_pan ?? null,
+      ps: data.ps ?? null,
+    };
+  }
+
+  /** Revokes a card token. */
+  async deleteCard(cardToken: string): Promise<void> {
+    await this.request(
+      'DELETE',
+      `/payment/card/${encodeURIComponent(cardToken)}`,
+    );
+  }
+
+  /** Step 1 of a token payment: nothing is debited yet. */
+  async createTokenPayment(params: {
+    cardToken: string;
+    /** Tiyin. */
+    amount: number;
+    invoiceId: string;
+    callbackUrl: string;
+    ip: string;
+    userAgent: string;
+  }): Promise<MulticardPayment> {
+    return toPayment(
+      await this.request<RawPayment>('POST', '/payment', {
+        card: { token: params.cardToken },
+        amount: params.amount,
+        store_id: Number(this.storeId),
+        invoice_id: params.invoiceId,
+        callback_url: params.callbackUrl,
+        device_details: { ip: params.ip, user_agent: params.userAgent },
+      }),
+    );
+  }
+
+  /**
+   * Step 2: debits the card. Without `otp` (otp_hash was null) the body is
+   * empty. ERROR_DEBIT_UNKNOWN / ERROR_CALLBACK_TIMEOUT mean "check status".
+   */
+  async confirmPayment(uuid: string, otp?: string): Promise<MulticardPayment> {
+    return toPayment(
+      await this.request<RawPayment>(
+        'PUT',
+        `/payment/${encodeURIComponent(uuid)}`,
+        otp === undefined ? {} : { otp, debit_available: false },
+      ),
+    );
+  }
+
+  async getPayment(uuid: string): Promise<MulticardPayment> {
+    return toPayment(
+      await this.request<RawPayment>(
+        'GET',
+        `/payment/${encodeURIComponent(uuid)}`,
+      ),
+    );
+  }
+
   /** Cancels an unpaid invoice. */
   async cancelInvoice(uuid: string): Promise<void> {
     await this.request('DELETE', `/payment/invoice/${uuid}`);
@@ -112,23 +239,27 @@ export class MulticardService {
   }
 
   private async request<T>(
-    method: 'POST' | 'DELETE',
+    method: 'GET' | 'POST' | 'PUT' | 'DELETE',
     path: string,
     body?: unknown,
     retried = false,
   ): Promise<T> {
     const token = await this.getToken();
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${token}`,
+    };
+    const init: RequestInit = {
+      method,
+      headers,
+      signal: AbortSignal.timeout(15_000),
+    };
+    if (body !== undefined && method !== 'GET') {
+      headers['Content-Type'] = 'application/json';
+      init.body = JSON.stringify(body);
+    }
     let response: Response;
     try {
-      response = await fetch(this.apiUrl + path, {
-        method,
-        headers: {
-          Authorization: `Bearer ${token}`,
-          ...(body ? { 'Content-Type': 'application/json' } : {}),
-        },
-        body: body ? JSON.stringify(body) : undefined,
-        signal: AbortSignal.timeout(15_000),
-      });
+      response = await fetch(this.apiUrl + path, init);
     } catch (error) {
       this.logger.error(`${method} ${path} failed: ${String(error)}`);
       throw new BadGatewayException('Payment provider is unavailable');
@@ -148,6 +279,9 @@ export class MulticardService {
         ? `${json.error.code}: ${json.error.details}`
         : `HTTP ${response.status}`;
       this.logger.error(`${method} ${path} rejected: ${error}`);
+      if (json?.error) {
+        throw new MulticardRejection(json.error.code, json.error.details);
+      }
       throw new BadGatewayException('Payment provider rejected the request');
     }
     return json.data as T;
@@ -191,6 +325,26 @@ export class MulticardService {
     this.token = { value: json.token, expiresAt: parseExpiry(json.expiry) };
     return json.token;
   }
+}
+
+interface RawPayment {
+  uuid: string;
+  status: string;
+  otp_hash?: string | null;
+  ps?: string | null;
+  receipt_url?: string | null;
+  payment_time?: string | null;
+}
+
+function toPayment(raw: RawPayment): MulticardPayment {
+  return {
+    uuid: raw.uuid,
+    status: raw.status,
+    otpHash: raw.otp_hash ?? null,
+    ps: raw.ps ?? null,
+    receiptUrl: raw.receipt_url ?? null,
+    paymentTime: raw.payment_time ?? null,
+  };
 }
 
 /** "YYYY-MM-DD HH:MM:SS" in GMT+5 → epoch ms (fallback: 10 minutes). */

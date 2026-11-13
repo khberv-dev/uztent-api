@@ -6,6 +6,8 @@ import {
   IsOptional,
   IsPositive,
   IsString,
+  IsUUID,
+  Matches,
   MaxLength,
 } from 'class-validator';
 
@@ -28,8 +30,22 @@ export class CreateDonationDto {
   @IsBoolean()
   anonymous?: boolean;
 
+  /**
+   * Pay with one of your saved cards (needs a token) instead of the payment
+   * page: charged right away, or after an SMS code if Multicard asks for one.
+   */
+  @IsOptional()
+  @IsUUID()
+  cardId?: string;
+
   /** Language of the Multicard payment page. */
   @IsOptional()
   @IsIn(['ru', 'uz', 'en'])
   lang?: 'ru' | 'uz' | 'en';
+}
+
+export class ConfirmDonationDto {
+  /** SMS code sent by Multicard to the card holder. */
+  @Matches(/^\d{4,8}$/, { message: 'otp must be 4 to 8 digits' })
+  otp: string;
 }

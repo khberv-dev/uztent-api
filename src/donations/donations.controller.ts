@@ -2,6 +2,7 @@ import {
   Body,
   Controller,
   Get,
+  Headers,
   HttpCode,
   HttpStatus,
   Ip,
@@ -9,13 +10,17 @@ import {
   ParseUUIDPipe,
   Post,
   Query,
+  UnauthorizedException,
 } from '@nestjs/common';
 import { OptionalUser } from '../common/decorators/optional-user.decorator.js';
 import { Public } from '../common/decorators/public.decorator.js';
 import type { AuthUser } from '../common/guards/jwt-auth.guard.js';
 import type { MulticardCallback } from '../payments/multicard.service.js';
 import { DonationsService } from './donations.service.js';
-import { CreateDonationDto } from './dto/create-donation.dto.js';
+import {
+  ConfirmDonationDto,
+  CreateDonationDto,
+} from './dto/create-donation.dto.js';
 import { DonationsQueryDto } from './dto/donations-query.dto.js';
 
 @Public()
@@ -33,8 +38,12 @@ export class DonationsController {
     @Body() dto: CreateDonationDto,
     @OptionalUser() user: AuthUser | undefined,
     @Ip() ip: string,
+    @Headers('user-agent') userAgent: string | undefined,
   ) {
-    return this.donationsService.create(idOrUsername, user, dto, ip);
+    return this.donationsService.create(idOrUsername, user, dto, {
+      ip,
+      userAgent: userAgent ?? 'unknown',
+    });
   }
 
   /** Paid donations of a live stream or VOD (same id). */
@@ -50,6 +59,18 @@ export class DonationsController {
   @Get('donations/:id')
   get(@Param('id', ParseUUIDPipe) id: string) {
     return this.donationsService.getById(id);
+  }
+
+  /** SMS code for a card payment (`otpRequired: true`). Donor only. */
+  @Post('donations/:id/confirm')
+  @HttpCode(HttpStatus.OK)
+  confirm(
+    @Param('id', ParseUUIDPipe) id: string,
+    @OptionalUser() user: AuthUser | undefined,
+    @Body() dto: ConfirmDonationDto,
+  ) {
+    if (!user) throw new UnauthorizedException();
+    return this.donationsService.confirm(id, user.id, dto.otp);
   }
 }
 

@@ -7,9 +7,12 @@ import {
   ManyToOne,
   PrimaryGeneratedColumn,
 } from 'typeorm';
+import { PaymentCard } from '../../payments/entities/payment-card.entity.js';
 import { User } from '../../users/entities/user.entity.js';
 
 export type DonationStatus = 'pending' | 'paid' | 'failed';
+/** checkout: Multicard's payment page; card: a saved card, charged by the API. */
+export type PaymentMethod = 'checkout' | 'card';
 
 /**
  * A donation to a live stream. `id` is sent to Multicard as `invoice_id`.
@@ -57,6 +60,21 @@ export class Donation {
 
   @Column({ type: 'varchar', length: 16, default: 'pending' })
   status: DonationStatus;
+
+  @Column({ type: 'varchar', length: 16, default: 'checkout' })
+  paymentMethod: PaymentMethod;
+
+  /** The saved card charged (card payments); null if the card was removed. */
+  @Column({ type: 'uuid', nullable: true })
+  cardId: string | null;
+
+  @ManyToOne(() => PaymentCard, { onDelete: 'SET NULL', nullable: true })
+  @JoinColumn()
+  card: PaymentCard | null;
+
+  /** Card payment waiting for the SMS code (POST /donations/:id/confirm). */
+  @Column({ default: false })
+  awaitingOtp: boolean;
 
   /** Multicard transaction uuid. */
   @Column({ type: 'varchar', unique: true, nullable: true })

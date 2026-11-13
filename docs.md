@@ -75,9 +75,14 @@ The lifecycle of a broadcast:
 | POST | `/streams/me/key` | Bearer | Generate your stream key, or replace it with a new one |
 | GET | `/streams` | **Public** | List live streams, newest first |
 | GET | `/streams/:idOrUsername` | **Public** | Get one live stream by its id, or a user's live stream by username |
-| POST | `/streams/:idOrUsername/donations` | **Public** (token optional) | Donate to a live stream: returns the Multicard payment page |
+| POST | `/streams/:idOrUsername/donations` | **Public** (token optional) | Donate to a live stream: Multicard payment page, or a saved card (`cardId`) |
 | GET | `/streams/:id/donations` | **Public** | Paid donations of a stream / VOD |
 | GET | `/donations/:id` | **Public** | One donation's status (for the return page) |
+| POST | `/donations/:id/confirm` | Bearer | Confirm a card donation with the SMS code (`otpRequired: true`) |
+| GET | `/payments/cards` | Bearer | Your saved cards |
+| POST | `/payments/cards` | Bearer | Start binding a card: returns Multicard's card form |
+| GET | `/payments/cards/bind/:bindId` | Bearer | Binding status (poll after the form) |
+| DELETE | `/payments/cards/:id` | Bearer | Remove a saved card |
 | GET | `/monetization/summary` | Bearer | Your earnings: all time, today, 7 / 30 days, average, largest |
 | GET | `/monetization/donations` | Bearer | Donations you received, filtered by status, stream, dates |
 | GET | `/monetization/daily` | Bearer | Your earnings per day (Asia/Tashkent), for charts |
@@ -91,6 +96,7 @@ The lifecycle of a broadcast:
 | POST | `/webhooks/mediamtx/online` | IP allowlist | MediaMTX: a broadcast went live |
 | POST | `/webhooks/mediamtx/offline` | IP allowlist | MediaMTX: a broadcast ended |
 | POST | `/webhooks/multicard` | Signed (md5) | Multicard: a donation was paid |
+| POST | `/webhooks/multicard/cards` | Verified via Multicard API | Multicard: a card was bound |
 | GET | `/streams/:id/chat` | **Public** | Chat history of a live stream or VOD |
 | POST | `/streams/:id/chat` | Bearer | Send a chat message (stream must be live) |
 | GET | `/streams/:id/chat/me` | Bearer | Your role in this chat, ban status, slow mode |
@@ -251,7 +257,12 @@ Any signed-in user can follow any other user (not themselves). A follow is one `
 
 ### Donations
 
-Viewers support a streamer with money. Payments go through **Multicard** using its hosted invoice: the donor pays on Multicard's page (`app.rhmt.uz`), and the API never sees card data.
+Viewers support a streamer with money. Payments go through **Multicard**, and the API never sees card numbers. The donor picks one of two ways to pay:
+
+- **Payment page** (default, anyone): the donor pays on Multicard's page (`app.rhmt.uz`). Steps below.
+- **Saved card** (signed-in donors): `cardId` of a card bound earlier. The API charges it directly, with no redirect. See [Saved cards](#saved-cards).
+
+Payment page:
 
 1. The donor sends `POST /streams/:idOrUsername/donations { amount, message?, anonymous? }`.
    - The API resolves the **live** stream: the app decides which stream gets the money.
@@ -272,14 +283,33 @@ Viewers support a streamer with money. Payments go through **Multicard** using i
 | `anonymous` | boolean | Guests are always anonymous; logged-in donors can choose |
 | `amount` | number | So'm, `DONATION_MIN_SOM`–`DONATION_MAX_SOM` (default 1,000–10,000,000). Sent to Multicard in tiyin (×100). |
 | `message` | string \| null | Optional, up to 200 characters |
-| `status` | string | `pending` → `paid`; `failed` if the invoice couldn't be created; `expired` if unpaid in time |
-| `checkoutUrl` | string \| null | Multicard payment page, only while `pending` |
+| `status` | string | `pending` → `paid`; `failed` if the invoice couldn't be created or the card was declined; `expired` if unpaid in time |
+| `paymentMethod` | string | `checkout` (payment page) or `card` (saved card) |
+| `checkoutUrl` | string \| null | Multicard payment page, only while `pending` (checkout only) |
+| `otpRequired` | boolean | Card payment waiting for the SMS code: send it to `POST /donations/:id/confirm` |
 | `expiresAt` / `paidAt` / `createdAt` | ISO date-time | |
 
 - **Who can donate:** anyone. A valid access token identifies the donor (their name is shown unless `anonymous: true`). Without a token, the donation is anonymous.
 - **Limits:** you can't donate to your own stream. Invoice creation is limited to `DONATION_INVOICES_PER_MINUTE` (default 5) per user, or per IP for guests.
 - **Privacy:** the donor's user id is stored even when anonymous, so admins can handle abuse, but it is never returned, not even to the streamer.
 - **Monetization:** the streamer inspects what they received with the `/monetization/*` endpoints (always their own channel, from the access token). Totals count only `paid` donations; amounts are so'm; days are calendar days in Asia/Tashkent (UTC+5).
+
+### Saved cards
+
+A signed-in user can bind Uzcard, Humo, Visa or Mastercard cards through **Multicard's card form**: the card number is typed on Multicard's page, and the API only stores Multicard's **card token** (never returned) and the masked number.
+
+**Binding:**
+1. `POST /payments/cards { phone }` (the card's SMS phone, `998XXXXXXXXX`) returns `bindId` and `formUrl`. Open `formUrl` (redirect or WebView). The form session lives 15 minutes.
+2. The user enters the card, and Multicard sends them to `CARD_BIND_RETURN_URL?bindId=<id>&result=success|declined`.
+3. Multicard calls `POST /webhooks/multicard/cards`. The callback isn't signed, so the API only uses it to find the session and then asks Multicard's API for the card. The client also polls `GET /payments/cards/bind/:bindId`; whichever comes first saves the card.
+4. At most 10 cards per user. `DELETE /payments/cards/:id` revokes the token at Multicard and removes the card; past donations keep their history.
+
+**Paying with a card:** `POST /streams/:idOrUsername/donations { amount, cardId, … }`.
+1. The API creates a Multicard payment with the card token (nothing is debited yet).
+2. If Multicard doesn't ask for an SMS code, the API confirms it immediately. The response is usually already `paid`, and `donation.received` has been sent.
+3. If Multicard asks for a code (depends on the card and Multicard's settings), the response is `pending` with `otpRequired: true`. The donor receives an SMS and sends it to `POST /donations/:id/confirm { otp }`. A wrong code can be retried.
+4. A declined card gives **402** `Payment was declined` with Multicard's code in `reason` (e.g. `ERROR_INSUFFICIENT_FUNDS`), and the donation is `failed`.
+5. If Multicard can't tell the outcome yet (`ERROR_DEBIT_UNKNOWN`), the donation stays `pending`. Multicard's success callback or `GET /donations/:id` (which asks Multicard, at most every 3 s) settles it.
 
 ---
 
@@ -449,6 +479,15 @@ A logged-out visitor can donate the same way; the donation is anonymous (`donorN
 2. Clicking **Follow** sends `POST /users/:userId/follow`; the response has the new `following` and `followersCount`, so the button updates without another request. **Unfollow** is `DELETE` on the same URL.
 3. The profile page lists `GET /users/:userId/followers` and `GET /users/:userId/following`.
 4. The streamer sees their count in `GET /streams/me` (`followersCount`).
+
+
+### 25. Viewer saves a card and donates in one click
+
+1. In settings, the viewer clicks **Add card** and types their phone. The app sends `POST /payments/cards { "phone": "998901234567" }` and opens `formUrl`.
+2. After the form, Multicard sends them back to `/settings/cards?bindId=…&result=success`. The page polls `GET /payments/cards/bind/:bindId` until `status` is `active`.
+3. On a stream, the donate form lists `GET /payments/cards` and a **Pay on Multicard's page** option. With a card selected, it sends `POST /streams/aziz_k/donations { "amount": 20000, "cardId": "…" }`.
+4. **201** with `status: "paid"`: done, and the alert is already on stream. With `otpRequired: true`, the form asks for the SMS code and sends `POST /donations/:id/confirm`.
+5. **402**: show "The card was declined" and let the donor pick another card or the payment page.
 
 ---
 
@@ -1424,6 +1463,7 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
 | `amount` | integer | yes | So'm, `DONATION_MIN_SOM`–`DONATION_MAX_SOM` (default 1,000–10,000,000) |
 | `message` | string | no | Up to 200 characters, trimmed |
 | `anonymous` | boolean | no | Hide the donor's name (logged-in donors). Guests are always anonymous. |
+| `cardId` | uuid | no | Pay with your saved card (needs a token) instead of the payment page |
 | `lang` | string | no | Payment page language: `uz`, `ru` or `en` |
 
 ```http
@@ -1449,7 +1489,9 @@ Content-Type: application/json
   "amount": 20000,
   "message": "gg",
   "status": "pending",
+  "paymentMethod": "checkout",
   "checkoutUrl": "https://app.rhmt.uz/invoice/f6339f31-6a09-11f0-9a1b-00505680eaf6",
+  "otpRequired": false,
   "expiresAt": "2026-11-13T16:30:00.000Z",
   "paidAt": null,
   "createdAt": "2026-11-13T16:00:00.000Z"
@@ -1458,12 +1500,51 @@ Content-Type: application/json
 
 Redirect the donor to `checkoutUrl`.
 
+**With a saved card:**
+
+```http
+POST /v1/streams/aziz_k/donations
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+Content-Type: application/json
+
+{
+  "amount": 20000,
+  "message": "gg",
+  "cardId": "0547bcfb-23c0-451d-8dbd-cd47d867d258"
+}
+```
+
+**201 Created**, charged without a redirect:
+
+```json
+{
+  "id": "5c55cd8a-bfa7-4d83-ac43-7afbcf866c5c",
+  "streamId": "d9b86c2e-2ddb-42d4-b204-5d0f18f067b5",
+  "donorName": "don_donor",
+  "anonymous": false,
+  "amount": 20000,
+  "message": "gg",
+  "status": "paid",
+  "paymentMethod": "card",
+  "checkoutUrl": null,
+  "otpRequired": false,
+  "expiresAt": "2026-11-13T16:30:00.000Z",
+  "paidAt": "2026-11-13T16:00:02.000Z",
+  "createdAt": "2026-11-13T16:00:00.000Z"
+}
+```
+
+If Multicard asks for an SMS code, the response is `"status": "pending", "otpRequired": true`: continue with [`POST /donations/:id/confirm`](#post-donationsidconfirm).
+
 **Errors**
 
 | Status | `message` | When |
 |---|---|---|
 | 400 | `amount must be between 1000 and 10000000 so'm` | Out of range (also: not an integer, message too long, unknown field) |
 | 400 | `You can't donate to your own stream` | The donor is the streamer |
+| 401 | `Sign in to pay with a saved card` | `cardId` without a valid token |
+| 402 | `Payment was declined` (+ `reason`, e.g. `ERROR_INSUFFICIENT_FUNDS`) | Multicard refused the card payment; the donation is `failed` |
+| 404 | `Card not found` | `cardId` isn't one of your cards |
 | 404 | `User is not live` / `User not found` / `Stream not found` | No live stream to donate to |
 | 429 | `Too many donation requests, try again in a minute` | Over `DONATION_INVOICES_PER_MINUTE` |
 | 502 | `Payment provider is unavailable` / `Payment provider rejected the request` | Multicard error; the donation is saved as `failed` |
@@ -1490,7 +1571,136 @@ GET /v1/streams/d9b86c2e-2ddb-42d4-b204-5d0f18f067b5/donations?limit=20
 GET /v1/donations/2f6c1d0a-8b4e-4c3a-9f1e-7d2b5a6c8e90
 ```
 
-**200 OK:** the donation. `status` is `pending`, `paid`, `failed` or `expired`. **Errors:** `400` (not a UUID), `404` `Donation not found`.
+**200 OK:** the donation. `status` is `pending`, `paid`, `failed` or `expired`. For a pending card payment whose outcome Multicard hadn't reported yet, this call asks Multicard (at most every 3 s). **Errors:** `400` (not a UUID), `404` `Donation not found`.
+
+---
+
+### POST /donations/:id/confirm
+
+**Bearer; the donor only.** Completes a card donation that has `otpRequired: true` with the SMS code Multicard sent to the card holder.
+
+```http
+POST /v1/donations/8c5d9f7a-afff-45ed-a34c-68a6a8830e1f/confirm
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+Content-Type: application/json
+
+{ "otp": "111111" }
+```
+
+**200 OK:** the donation, now `"status": "paid"` and `"otpRequired": false` (`donation.received` is sent).
+
+| Status | `message` | When |
+|---|---|---|
+| 400 | `["otp must be 4 to 8 digits"]` | Format |
+| 400 | `Wrong confirmation code` | Wrong SMS code; the donation stays pending, try again |
+| 400 | `This donation doesn't need confirmation` | Not a pending card payment waiting for a code |
+| 400 | `This donation has expired` | Past `expiresAt` |
+| 401 | `Unauthorized` | No token |
+| 402 | `Payment was declined` (+ `reason`) | Multicard refused; the donation is `failed` |
+| 404 | `Donation not found` | Unknown, or not your donation |
+
+---
+
+### GET /payments/cards
+
+**Bearer.** Your saved cards, newest first. The card token is never returned.
+
+```http
+GET /v1/payments/cards
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+```
+
+**200 OK**
+
+```json
+[
+  {
+    "id": "0547bcfb-23c0-451d-8dbd-cd47d867d258",
+    "cardPan": "986027******1519",
+    "ps": "humo",
+    "createdAt": "2026-11-13T16:46:02.726Z"
+  }
+]
+```
+
+`ps` is `uzcard`, `humo`, `visa`, `mastercard` or `unionpay`.
+
+---
+
+### POST /payments/cards
+
+**Bearer.** Starts binding a card. Open `formUrl` (redirect or WebView); the user enters the card there. Afterwards Multicard sends them to `CARD_BIND_RETURN_URL?bindId=<bindId>&result=success` (or `result=declined`).
+
+```http
+POST /v1/payments/cards
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+Content-Type: application/json
+
+{ "phone": "998901234567" }
+```
+
+`phone`: the phone number the card sends SMS to, `998XXXXXXXXX` (required by Multicard for Humo cards; it isn't stored).
+
+**201 Created**
+
+```json
+{
+  "bindId": "4ceac41b-d657-4f66-8905-fcda41a5313d",
+  "formUrl": "https://dev-checkout.multicard.uz/card/bd8729bf6d3a4",
+  "expiresAt": "2026-11-13T17:01:02.704Z"
+}
+```
+
+| Status | `message` | When |
+|---|---|---|
+| 400 | `["phone must be in the format 998XXXXXXXXX"]` | Format |
+| 400 | `You can link at most 10 cards` | Limit reached |
+| 502 | `Payment provider is unavailable` / `Payment provider rejected the request` | Multicard error |
+
+---
+
+### GET /payments/cards/bind/:bindId
+
+**Bearer.** Binding status. Poll it after the user returns from the form (every 1–2 s, for up to ~30 s).
+
+```http
+GET /v1/payments/cards/bind/4ceac41b-d657-4f66-8905-fcda41a5313d
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+```
+
+**200 OK**
+
+```json
+{
+  "status": "active",
+  "card": {
+    "id": "0547bcfb-23c0-451d-8dbd-cd47d867d258",
+    "cardPan": "986027******1519",
+    "ps": "humo",
+    "createdAt": "2026-11-13T16:46:02.726Z"
+  }
+}
+```
+
+`status`: `pending` (form not finished, `card: null`), `active` (saved), `deleted`.
+
+| Status | `message` | When |
+|---|---|---|
+| 404 | `Card binding not found or expired` | Unknown, someone else's, or older than 20 minutes |
+| 409 | `This card is linked to another account` | The same card is already saved by another user |
+
+---
+
+### DELETE /payments/cards/:id
+
+**Bearer.** Removes a saved card and revokes its token at Multicard. Past donations made with it are kept.
+
+```http
+DELETE /v1/payments/cards/0547bcfb-23c0-451d-8dbd-cd47d867d258
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+```
+
+**204 No Content.** **Errors:** `404` `Card not found`, `502` if Multicard is unreachable (the card is kept; try again).
 
 ---
 
@@ -2064,10 +2274,15 @@ api: yes
 apiAddress: 127.0.0.1:8088
 
 rtsp: yes
+rtspTransports: [tcp]         # the transcoder relay below must not lose packets
 rtspAddress: 127.0.0.1:8553   # internal only: used by the ffmpeg below
 rtmp: yes                     # encoders publish here (:1935)
 hls: yes
 hlsAddress: :8888             # viewers play here (HLS_BASE_URL)
+hlsAlwaysRemux: yes           # muxer per live path: no cold start, never closed mid-stream
+hlsVariant: fmp4              # standard HLS; Low-Latency HLS needs HTTPS on Apple devices
+hlsSegmentCount: 10           # ~20 s window with a 2 s keyframe interval
+hlsSegmentDuration: 2s
 
 paths:
   ~^live/(.+)$:
@@ -2087,6 +2302,13 @@ paths:
 - **Addresses:** if the API runs elsewhere, replace `http://127.0.0.1:8000/v1` with its address as seen from MediaMTX, and add MediaMTX's IP to the API's `WEBHOOK_ALLOWED_IPS`.
 - **Renditions:** the `watch/…/(1080)` paths must match the API's `STREAM_RENDITIONS`. Its transcoder publishes are allowed without a key because they come from loopback.
 - **Requirements:** the host needs `ffmpeg` (transcoder) and `curl` (hooks).
+- **HLS settings** (they fix players that 404, load slowly or drop with 302 / 404):
+  - `hlsVariant: fmp4`: MediaMTX's default, Low-Latency HLS, needs HTTPS to work on Safari / iOS and logs "part duration changed … will cause an error in iOS clients" with copied OBS streams. Standard HLS works everywhere, at about 6–10 s of latency. To go back to LL-HLS, serve HLS over HTTPS (`hlsEncryption` or a TLS proxy) first.
+  - `hlsAlwaysRemux: yes`: without it, the first viewer waits about 3 s while the muxer starts and collects segments.
+  - `hlsSegmentCount: 10`: players more than the window behind (slow PCs, throttled tabs) request segments that are already deleted (404).
+  - `rtspTransports: [tcp]`: the transcoder copies the full bitrate over loopback RTSP. Over UDP, dropped packets corrupt or stall the `watch/…` rendition, and every ffmpeg restart starts a new muxer whose segment names differ (old URLs 404).
+  - Ask encoders for a **2 s keyframe interval** (OBS: Output → Keyframe Interval = 2). Segments can't be shorter than the keyframe interval, and OBS's default ("0 = auto") can produce long, uneven segments.
+- **Sessions:** MediaMTX v1.21 tracks each player as a session. The first playlist request redirects (`302`) to `…?cookieCheck=1`, and the playlists then carry `?session=…` (or a cookie). A session idle for about 30 s is closed, and its URLs answer **401**: a player in a background tab, or one paused for a while, must reload the playlist (the [player](#hls-player) does).
 - **Docker:** the official `bluenviron/mediamtx` image has no shell, `curl` or `ffmpeg`, so the hooks fail in it. Build an image with them:
   ```dockerfile
   FROM alpine:3.22
@@ -2102,13 +2324,19 @@ paths:
 
 ## Multicard integration (donations)
 
-Donations use Multicard's **hosted invoice** strategy ([docs.multicard.uz](https://docs.multicard.uz)): the API creates an invoice, the donor pays on Multicard's page, and Multicard calls back.
+Donations use two Multicard flows ([docs.multicard.uz](https://docs.multicard.uz)): the **hosted invoice** (the donor pays on Multicard's page) and **card binding (form) + payment by card token** (the API charges a saved card). Card binding through the form doesn't need a PCI DSS certificate.
 
 | Step | Multicard API | Notes |
 |---|---|---|
 | Token | `POST /auth { application_id, secret }` | JWT, cached until shortly before `expiry` (GMT+5). A `401` triggers a new token and one retry. |
 | Invoice | `POST /payment/invoice` | `store_id`, `amount` (tiyin), `invoice_id` = donation id, `callback_url`, `return_url` (`DONATION_RETURN_URL?donationId=…`), `lang`, `ttl` (no `ofd` fiscal data). Returns `uuid` and `checkout_url` (`app.rhmt.uz`). |
-| Callback | → `POST /v1/webhooks/multicard` | See below |
+| Bind card | `POST /payment/card/bind` | `store_id`, `phone`, `redirect_url` / `redirect_decline_url` (`CARD_BIND_RETURN_URL?bindId=…&result=…`), `callback_url` (`MULTICARD_CARD_CALLBACK_URL`). Returns `session_id` and `form_url`. |
+| Bind status | `GET /payment/card/bind/:session_id` | `status` (`active` / `draft` / `deleted`), `card_token`, `card_pan`, `ps`. The source of truth for a binding. |
+| Remove card | `DELETE /payment/card/:card_token` | `ERROR_CARD_NOT_FOUND` is ignored (already gone). |
+| Card payment | `POST /payment` | `card.token`, `amount` (tiyin), `store_id`, `invoice_id` = donation id, `callback_url`, `device_details { ip, user_agent }` of the donor. Returns `uuid` and `otp_hash` (null = no SMS code needed). |
+| Confirm | `PUT /payment/:uuid` | Empty body, or `{ otp, debit_available: false }`. `ERROR_WRONG_OTP` → retry; `ERROR_DEBIT_UNKNOWN` / `ERROR_CALLBACK_TIMEOUT` → check status. |
+| Payment status | `GET /payment/:uuid` | `success` → paid; `error` / `revert` → failed; anything else is still in progress. |
+| Callbacks | → `POST /v1/webhooks/multicard`, `POST /v1/webhooks/multicard/cards` | See below |
 
 ### POST /webhooks/multicard
 
@@ -2140,11 +2368,27 @@ Called by Multicard after a successful payment (`callback_url`). Always answers 
 
 Anything but `success: true` makes Multicard cancel and refund that payment. A donation is marked paid with a conditional update, so concurrent or repeated callbacks produce exactly one `donation.received`.
 
+### POST /webhooks/multicard/cards
+
+Called by Multicard when a user finishes the card form (`callback_url` of the binding). The body isn't signed, so the API only reads `payer_id` (= `session_id`), finds the binding, and fetches the card from `GET /payment/card/bind/:session_id`. It always answers HTTP 200 `{ "success": true }`; otherwise Multicard retries every 60 s, 5 times.
+
+```json
+{
+  "payer_id": "688470c8060af",
+  "card_pan": "986027******1519",
+  "card_token": "6225f3c93f7a880142782fa4",
+  "ps": "humo",
+  "status": "active",
+  "added_on": "2025-03-17 03:19:12"
+}
+```
+
 ### Multicard setup
 
 1. Get `application_id`, `secret` and `store_id` from Multicard, and set `MULTICARD_*` in `.env`. Use `https://dev-mesh.multicard.uz` while testing (test card `8600 5333 6409 8829`, expiry `28/06`, OTP `111111`), then `https://mesh.multicard.uz`.
 2. Set `MULTICARD_CALLBACK_URL` to the API's **public** HTTPS URL + `/v1/webhooks/multicard`. Multicard calls it from `195.158.26.90`.
 3. Point `DONATION_RETURN_URL` at the web app page that shows the result.
+4. For saved cards: set `MULTICARD_CARD_CALLBACK_URL` to the public URL + `/v1/webhooks/multicard/cards`, and `CARD_BIND_RETURN_URL` to the web app page that finishes binding. Ask Multicard whether card payments on your store need an SMS code (`otp_required`); the API supports both.
 
 ---
 
@@ -3257,14 +3501,47 @@ export function HlsPlayer({ src }: { src: string }) {
     if (!video) return;
 
     if (Hls.isSupported()) {
-      const hls = new Hls({ lowLatencyMode: true });
+      // The media server serves standard HLS (hlsVariant: fmp4).
+      const hls = new Hls({ lowLatencyMode: false, liveSyncDurationCount: 3 });
+      let retry: ReturnType<typeof setTimeout> | undefined;
+      hls.on(Hls.Events.ERROR, (_event, data) => {
+        if (!data.fatal) return; // hls.js retries these itself
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+          hls.recoverMediaError();
+          return;
+        }
+        // Network errors: the media server's session expired (401 after the
+        // tab was idle), the rendition isn't published yet right after
+        // stream.started (404), or the transcoder restarted. Start over with
+        // the original URL, which opens a new session.
+        clearTimeout(retry);
+        retry = setTimeout(() => {
+          hls.loadSource(src);
+          hls.startLoad();
+        }, 2000);
+      });
       hls.loadSource(src);
       hls.attachMedia(video);
-      return () => hls.destroy();
+      return () => {
+        clearTimeout(retry);
+        hls.destroy();
+      };
     }
     if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      // Native HLS (Safari): reload the source after a failure.
+      let retry: ReturnType<typeof setTimeout> | undefined;
+      const onError = () => {
+        clearTimeout(retry);
+        retry = setTimeout(() => {
+          video.src = src;
+          void video.play().catch(() => {});
+        }, 2000);
+      };
+      video.addEventListener('error', onError);
       video.src = src;
       return () => {
+        clearTimeout(retry);
+        video.removeEventListener('error', onError);
         video.removeAttribute('src');
         video.load();
       };
@@ -3377,7 +3654,8 @@ export function ChannelPage({ username }: { username: string }) {
 Playback notes:
 - **Same URLs every broadcast.** A user's `url` and rendition URLs don't change between broadcasts. When they're offline the media server returns 404, so only render the player for streams that are live (in `listLiveStreams()` or announced by `stream.started`).
 - **Autoplay** only works muted (`muted` is set), so let the user unmute.
-- **Redirect:** the media server first answers with a `302` to `…?cookieCheck=1`. hls.js follows it automatically.
+- **Redirect and sessions:** the media server first answers with a `302` to `…?cookieCheck=1`, and hls.js follows it. The playlists then carry `?session=…`. A session idle for about 30 s answers `401`, so the player reloads from the original URL after any fatal network error.
+- **Right after `stream.started`**, the `1080` rendition can take a second or two to appear (the transcoder starts after the broadcast), so the first requests can 404. The player retries every 2 s.
 - **Not yet tested in a browser:** playback has been verified with ffprobe, not with hls.js. If segments fail to load cross-origin, check MediaMTX's `hlsAllowOrigin` (default `*`).
 - **When a stream ends**, `getLiveStream(id)` returns `404`. A VOD with the **same `id`** appears in the streamer's VODs.
 - **`viewers`** arrives every 5 s through `stream.viewers`; no polling needed. Viewers who leave are dropped about 40 s later.
@@ -3988,6 +4266,8 @@ Set in `.env` (see `.env.example`). The server won't start if any of these is mi
 | `DONATION_INVOICE_TTL_SECONDS` | `1800` | Unpaid invoices are cancelled after this |
 | `DONATION_INVOICES_PER_MINUTE` | `5` | Invoice creation limit per user (or IP for guests) |
 | `DONATION_RETURN_URL` | `http://localhost:5173/donations/complete` | Where Multicard sends the donor after paying (`?donationId=` appended) |
+| `MULTICARD_CARD_CALLBACK_URL` | `https://api.example.uz/v1/webhooks/multicard/cards` | Public URL Multicard calls when a card is bound |
+| `CARD_BIND_RETURN_URL` | `http://localhost:5173/settings/cards` | Where Multicard sends the user after the card form (`?bindId=…&result=success\|declined` appended) |
 | `STREAM_PUBLISH_URL` | `rtmp://localhost:1935/live` | MediaMTX's public RTMP address plus `/live`, returned as `publishUrl`. It's saved on the user's stream settings when the key is generated, so changing it only affects keys generated afterwards. |
 
 The database schema is created and updated automatically from the entities at startup (TypeORM `synchronize`). There are no migrations.
@@ -4033,3 +4313,5 @@ Deploy the `public/` folder next to `dist/`. Anything put there is publicly down
   - The callback is trusted by its md5 signature only; its source IP (`195.158.26.90`) isn't enforced.
   - No refunds, streamer payouts or earnings report in the API yet. Money settles to the Multicard store, and payouts to streamers are handled outside the app.
   - A donation that Multicard pays after `expiresAt` (e.g. a late callback) is still accepted and announced.
+  - Card binding and card payments are also tested only against the mock. Multicard's docs don't show a full PaymentModel for the token-payment response, so check the sandbox for the exact `status` after confirmation.
+  - Deleting a user account removes their saved cards in the database, but doesn't revoke the tokens at Multicard (there's no account deletion endpoint yet).
