@@ -87,6 +87,7 @@ The lifecycle of a broadcast:
 | GET | `/streams/me/bans` | Bearer | List users banned from your chat |
 | POST | `/streams/me/bans` | Bearer | Ban a user from your chat |
 | DELETE | `/streams/me/bans/:userId` | Bearer | Unban a user |
+| GET | `/legal/privacy`, `/legal/terms` (no API prefix) | **Public** | Privacy Policy and Terms of Use (static HTML from `public/`) |
 | WS | `/ws` (no API prefix) | **Public** | [Real-time events](#websocket-events): stream started/ended, viewer counts, chat |
 
 ---
@@ -3243,6 +3244,8 @@ Set in `.env` (see `.env.example`). The server won't start if any of these is mi
 The database schema is created and updated automatically from the entities at startup (TypeORM `synchronize`). There are no migrations.
 
 The WebSocket path `/ws` is fixed and not configurable.
+
+The legal pages are static files in `public/` (`privacy.html`, `terms.html`), served at `/legal/privacy` and `/legal/terms` by `@nestjs/serve-static`. Deploy the `public/` folder next to `dist/`.
 
 ---
 

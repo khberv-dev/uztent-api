@@ -1,7 +1,9 @@
 import { ClassSerializerInterceptor, Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { APP_INTERCEPTOR, APP_PIPE } from '@nestjs/core';
+import { ServeStaticModule } from '@nestjs/serve-static';
 import { TypeOrmModule } from '@nestjs/typeorm';
+import { join } from 'node:path';
 import { AuthModule } from './auth/auth.module.js';
 import { ChatModule } from './chat/chat.module.js';
 import { EventsModule } from './events/events.module.js';
@@ -21,6 +23,13 @@ import { UsersModule } from './users/users.module.js';
         ...createDataSource(config).options,
         autoLoadEntities: true,
       }),
+    }),
+    // Legal pages: /legal/privacy, /legal/terms (outside API_PREFIX).
+    // serveRoot keeps the module's catch-all route under /legal, away from the API.
+    ServeStaticModule.forRoot({
+      rootPath: join(import.meta.dirname, '..', 'public'),
+      serveRoot: '/legal',
+      serveStaticOptions: { extensions: ['html'], index: false },
     }),
     RedisModule,
     EventsModule,

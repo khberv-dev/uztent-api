@@ -4,6 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 NestJS 12 API (Express) on TypeORM 1.x + PostgreSQL and Redis (ioredis), with JWT auth, Google sign-in, live streams and VODs. No tests exist yet, and the README is the stock Nest starter text.
 
+`public/privacy.html` and `public/terms.html` are served at `/legal/privacy` and `/legal/terms` (`ServeStaticModule` in `AppModule`). `serveRoot: '/legal'` is required: without it, the module's catch-all `GET` route would shadow the API's routes. The policies describe what the app actually collects, so update them when data handling changes (new fields, third parties, retention).
+
 `docs.md` is the single source of documentation: architecture, how it works, use cases, REST and WebSocket APIs with request/response samples, MediaMTX integration, and a complete React client (its code was type-checked and its API layer run against the API). Update it whenever endpoints, events, DTO rules or error messages change.
 
 ## Commands
