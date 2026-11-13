@@ -1,0 +1,55 @@
+# MediaMTX 1.21.x config for the Uztent API.
+# Only the settings that differ from MediaMTX's defaults are listed.
+#
+# Replace http://api:3000/v1 with the API's address as seen from MediaMTX
+# (the API's PORT and API_PREFIX), and add MediaMTX's IP to the API's
+# WEBHOOK_ALLOWED_IPS.
+#
+# Encoders publish to rtmp://<host>:1935/live/<streamId>?key=<streamKey>
+# (OBS: Server = publishUrl, Stream Key = encoderStreamKey from GET /streams/me).
+# HLS: original at http://<host>:8888/live/<streamId>/index.m3u8, transcoded
+# renditions at http://<host>:8888/watch/<streamId>/{1080,720,480}/index.m3u8
+# (keep in sync with the API's STREAM_RENDITIONS).
+
+# Before every publish/read, MediaMTX POSTs the request to the API.
+# The API allows reads and allows a publish only with the right key.
+# Control API, polled by the API for viewer counts (MEDIAMTX_API_URL).
+# Excluded from auth below, so never publish this port outside the private network.
+api: yes
+apiAddress: :9997
+
+authMethod: http
+authHTTPAddress: http://api:3000/v1/webhooks/mediamtx/auth
+authHTTPExclude:
+  - action: api
+  - action: metrics
+  - action: pprof
+
+paths:
+  # Only live/<uuid> paths exist; anything else is rejected.
+  "~^live/([0-9a-f-]{36})$":
+    # Transcoder: republishes 1080 (copy), 720 and 480 to watch/<streamId>/<quality>.
+    # The API allows these publishes because they come from loopback.
+    runOnAvailable: >
+      ffmpeg -rtsp_transport tcp -i rtsp://127.0.0.1:$RTSP_PORT/$MTX_PATH
+      -filter_complex "[0:v]split=2[a][b];[a]scale=-2:720[v720];[b]scale=-2:480[v480]"
+
+      -map 0:v -map 0:a? -c:v copy -c:a copy
+      -f rtsp -rtsp_transport tcp rtsp://127.0.0.1:$RTSP_PORT/watch/$G1/1080
+
+      -map [v720] -map 0:a? -c:v libx264 -preset veryfast -tune zerolatency
+      -b:v 2800k -maxrate 2800k -bufsize 5600k -bf 0
+      -force_key_frames expr:gte(t,n_forced*2) -c:a copy
+      -f rtsp -rtsp_transport tcp rtsp://127.0.0.1:$RTSP_PORT/watch/$G1/720
+
+      -map [v480] -map 0:a? -c:v libx264 -preset veryfast -tune zerolatency
+      -b:v 1200k -maxrate 1200k -bufsize 2400k -bf 0
+      -force_key_frames expr:gte(t,n_forced*2) -c:a copy
+      -f rtsp -rtsp_transport tcp rtsp://127.0.0.1:$RTSP_PORT/watch/$G1/480
+    runOnAvailableRestart: yes
+    # Publisher is live -> API starts a live session.
+    runOnOnline: curl -fsS -X POST http://api:3000/v1/webhooks/mediamtx/online -d path=$MTX_PATH
+    # Publisher left -> API ends the session and saves the VOD.
+    runOnOffline: curl -fsS -X POST http://api:3000/v1/webhooks/mediamtx/offline -d path=$MTX_PATH
+
+  "~^watch/[0-9a-f-]{36}/(1080|720|480)$":
