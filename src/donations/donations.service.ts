@@ -226,7 +226,7 @@ export class DonationsService {
   }
 }
 
-function toView(d: Donation): DonationView {
+export function toView(d: Donation): DonationView {
   const expired = d.status === 'pending' && d.expiresAt.getTime() < Date.now();
   return {
     id: d.id,

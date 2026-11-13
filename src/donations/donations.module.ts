@@ -9,6 +9,8 @@ import {
 } from './donations.controller.js';
 import { DonationsService } from './donations.service.js';
 import { Donation } from './entities/donation.entity.js';
+import { MonetizationController } from './monetization.controller.js';
+import { MonetizationService } from './monetization.service.js';
 
 @Module({
   imports: [
@@ -17,7 +19,11 @@ import { Donation } from './entities/donation.entity.js';
     StreamsModule,
     UsersModule,
   ],
-  controllers: [DonationsController, MulticardWebhookController],
-  providers: [DonationsService],
+  controllers: [
+    DonationsController,
+    MulticardWebhookController,
+    MonetizationController,
+  ],
+  providers: [DonationsService, MonetizationService],
 })
 export class DonationsModule {}

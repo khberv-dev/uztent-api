@@ -73,6 +73,11 @@ The lifecycle of a broadcast:
 | POST | `/streams/:idOrUsername/donations` | **Public** (token optional) | Donate to a live stream: returns the Multicard payment page |
 | GET | `/streams/:id/donations` | **Public** | Paid donations of a stream / VOD |
 | GET | `/donations/:id` | **Public** | One donation's status (for the return page) |
+| GET | `/monetization/summary` | Bearer | Your earnings: all time, today, 7 / 30 days, average, largest |
+| GET | `/monetization/donations` | Bearer | Donations you received, filtered by status, stream, dates |
+| GET | `/monetization/daily` | Bearer | Your earnings per day (Asia/Tashkent), for charts |
+| GET | `/monetization/streams` | Bearer | Your earnings per stream / VOD |
+| GET | `/monetization/top-donors` | Bearer | Your biggest named donors |
 | GET | `/vods/me` | Bearer | List your VODs |
 | GET | `/users/:userId/vods` | Bearer | List a user's VODs |
 | GET | `/vods/:id` | Bearer | Get one VOD |
@@ -260,7 +265,8 @@ Viewers support a streamer with money. Payments go through **Multicard** using i
 
 - **Who can donate:** anyone. A valid access token identifies the donor (their name is shown unless `anonymous: true`). Without a token, the donation is anonymous.
 - **Limits:** you can't donate to your own stream. Invoice creation is limited to `DONATION_INVOICES_PER_MINUTE` (default 5) per user, or per IP for guests.
-- **Privacy:** the donor's user id is stored even when anonymous, so the streamer and admins can handle abuse, but it is never returned publicly.
+- **Privacy:** the donor's user id is stored even when anonymous, so admins can handle abuse, but it is never returned, not even to the streamer.
+- **Monetization:** the streamer inspects what they received with the `/monetization/*` endpoints (always their own channel, from the access token). Totals count only `paid` donations; amounts are so'm; days are calendar days in Asia/Tashkent (UTC+5).
 
 ---
 
@@ -416,6 +422,13 @@ A logged-out visitor can donate the same way; the donation is anonymous (`donorN
 - Multicard is down or rejects the invoice: **502**, and the donation is `failed`. Show "try again later".
 - The donor closes the payment page: after `DONATION_INVOICE_TTL_SECONDS` the donation shows as `expired`, and no event is sent.
 - A forged or mismatched callback is answered `success: false`, so Multicard cancels and refunds that payment.
+
+### 23. Streamer checks their earnings
+
+1. The dashboard loads `GET /monetization/summary` for the headline numbers (today, last 7 / 30 days, all time) and `GET /monetization/daily` for a 30-day chart.
+2. A **Donations** tab pages through `GET /monetization/donations`, and can filter by stream (`?streamId=`), date range, or status (e.g. `?status=expired` to see abandoned payments).
+3. A **Streams** tab shows `GET /monetization/streams`: how much each broadcast earned, with the live one first.
+4. `GET /monetization/top-donors?from=…` lists the biggest supporters of the month. Each entry has `donorId`, so the streamer can thank them or make them a chat moderator.
 
 ---
 
@@ -1352,6 +1365,220 @@ GET /v1/donations/2f6c1d0a-8b4e-4c3a-9f1e-7d2b5a6c8e90
 ```
 
 **200 OK:** the donation. `status` is `pending`, `paid`, `failed` or `expired`. **Errors:** `400` (not a UUID), `404` `Donation not found`.
+
+---
+
+### Monetization
+
+**Bearer.** Donations **you received** as a streamer; the channel is always the caller's. Totals count only `paid` donations, amounts are in so'm, and "today" / daily buckets are Asia/Tashkent days (UTC+5). Anonymous donations are counted but never reveal the donor.
+
+Donations returned here have the [public shape](#donations) plus:
+
+| Field | Type | Notes |
+|---|---|---|
+| `donorId` | uuid \| null | The donor's user id; `null` for guests and anonymous donations |
+| `paymentSystem` | string \| null | Reported by Multicard (`uzcard`, `humo`, …), once paid |
+
+---
+
+### GET /monetization/summary
+
+```http
+GET /v1/monetization/summary
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+```
+
+**200 OK**
+
+```json
+{
+  "currency": "UZS",
+  "allTime": { "amount": 85000, "count": 4 },
+  "today": { "amount": 15000, "count": 2 },
+  "last7Days": { "amount": 15000, "count": 2 },
+  "last30Days": { "amount": 85000, "count": 4 },
+  "averageAmount": 21250,
+  "donors": 1,
+  "largest": {
+    "id": "2f6c1d0a-8b4e-4c3a-9f1e-7d2b5a6c8e90",
+    "streamId": "a1b2c3d4-0000-4000-8000-000000000001",
+    "donorName": "don_donor",
+    "anonymous": false,
+    "amount": 50000,
+    "message": "gg",
+    "status": "paid",
+    "checkoutUrl": null,
+    "expiresAt": "2026-11-03T16:30:00.000Z",
+    "paidAt": "2026-11-03T16:15:00.000Z",
+    "createdAt": "2026-11-03T16:00:00.000Z",
+    "donorId": "6f1e2d3c-4b5a-4968-8776-5a4b3c2d1e0f",
+    "paymentSystem": "uzcard"
+  }
+}
+```
+
+- `today` starts at 00:00 Tashkent time; `last7Days` / `last30Days` are rolling windows ending now.
+- `donors`: distinct logged-in donors who weren't anonymous.
+- `largest` is `null` and everything else `0` when nothing was paid yet.
+
+---
+
+### GET /monetization/donations
+
+Donations you received, [paginated](#conventions), newest first.
+
+| Query | Default | Notes |
+|---|---|---|
+| `status` | `paid` | `paid`, `pending` (still payable), `expired`, `failed` or `all` |
+| `streamId` | | Only this live stream / VOD |
+| `from` / `to` | | ISO 8601; `from` inclusive, `to` exclusive. Filters `paidAt` for `paid`, `createdAt` otherwise. Sorted by the same field. |
+| `page` / `limit` | 1 / 20 | `limit` ≤ 100 |
+
+```http
+GET /v1/monetization/donations?status=paid&from=2026-11-01T00:00:00%2B05:00&limit=2
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+```
+
+**200 OK**
+
+```json
+{
+  "items": [
+    {
+      "id": "7a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+      "streamId": "d9b86c2e-2ddb-42d4-b204-5d0f18f067b5",
+      "donorName": "don_donor",
+      "anonymous": false,
+      "amount": 10000,
+      "message": "gg",
+      "status": "paid",
+      "checkoutUrl": null,
+      "expiresAt": "2026-11-13T16:30:00.000Z",
+      "paidAt": "2026-11-13T16:15:00.000Z",
+      "createdAt": "2026-11-13T16:00:00.000Z",
+      "donorId": "6f1e2d3c-4b5a-4968-8776-5a4b3c2d1e0f",
+      "paymentSystem": "uzcard"
+    },
+    {
+      "id": "9c8b7a6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+      "streamId": "d9b86c2e-2ddb-42d4-b204-5d0f18f067b5",
+      "donorName": null,
+      "anonymous": true,
+      "amount": 5000,
+      "message": "salom!",
+      "status": "paid",
+      "checkoutUrl": null,
+      "expiresAt": "2026-11-13T16:29:00.000Z",
+      "paidAt": "2026-11-13T16:14:00.000Z",
+      "createdAt": "2026-11-13T15:59:00.000Z",
+      "donorId": null,
+      "paymentSystem": "humo"
+    }
+  ],
+  "total": 4,
+  "page": 1,
+  "limit": 2
+}
+```
+
+**Errors:** `400` `["status must be one of the following values: paid, pending, failed, expired, all"]`, `["from must be a valid ISO 8601 date string"]`, `["streamId must be a UUID"]`, `from must be before to`.
+
+---
+
+### GET /monetization/daily
+
+Paid totals per Tashkent calendar day, oldest first, **one entry per day** (zeros included). `from` / `to` are `YYYY-MM-DD`, both inclusive; the default is the last 30 days ending today, and a range can be at most 366 days.
+
+```http
+GET /v1/monetization/daily?from=2026-11-11&to=2026-11-13
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+```
+
+**200 OK**
+
+```json
+[
+  { "date": "2026-11-11", "amount": 0, "count": 0 },
+  { "date": "2026-11-12", "amount": 70000, "count": 2 },
+  { "date": "2026-11-13", "amount": 15000, "count": 2 }
+]
+```
+
+**Errors:** `400` `["from must be YYYY-MM-DD"]`, `from is not a valid date` (e.g. `2026-02-30`), `from must not be after to`, `The range can't be longer than 366 days`.
+
+---
+
+### GET /monetization/streams
+
+Paid totals per stream, most recent stream first, [paginated](#conventions) (`page`, `limit`). Only streams that received at least one paid donation are listed.
+
+```http
+GET /v1/monetization/streams?limit=2
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+```
+
+**200 OK**
+
+```json
+{
+  "items": [
+    {
+      "streamId": "d9b86c2e-2ddb-42d4-b204-5d0f18f067b5",
+      "title": "Late night ranked",
+      "live": true,
+      "startedAt": "2026-11-13T15:00:00.000Z",
+      "endedAt": null,
+      "amount": 15000,
+      "count": 2,
+      "lastPaidAt": "2026-11-13T16:15:00.000Z"
+    },
+    {
+      "streamId": "a1b2c3d4-0000-4000-8000-000000000001",
+      "title": "Old stream",
+      "live": false,
+      "startedAt": "2026-11-03T14:00:00.000Z",
+      "endedAt": "2026-11-03T16:40:00.000Z",
+      "amount": 70000,
+      "count": 2,
+      "lastPaidAt": "2026-11-03T16:15:00.000Z"
+    }
+  ],
+  "total": 2,
+  "page": 1,
+  "limit": 2
+}
+```
+
+`title`, `startedAt` and `endedAt` come from the live stream or its VOD; they're `null` if the VOD was deleted (the donations are kept).
+
+---
+
+### GET /monetization/top-donors
+
+Logged-in donors who **weren't anonymous**, ranked by total paid. Optional `from` / `to` (ISO 8601, as in `/monetization/donations`) and `limit` (1–100, default 10).
+
+```http
+GET /v1/monetization/top-donors?from=2026-11-01T00:00:00%2B05:00&limit=3
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+```
+
+**200 OK**
+
+```json
+[
+  {
+    "donorId": "6f1e2d3c-4b5a-4968-8776-5a4b3c2d1e0f",
+    "username": "don_donor",
+    "firstName": "Donor",
+    "lastName": "Doe",
+    "amount": 60000,
+    "count": 2,
+    "lastPaidAt": "2026-11-13T16:15:00.000Z"
+  }
+]
+```
+
+Names are the donor's **current** profile. An anonymous donation never counts toward its donor here.
 
 ---
 
