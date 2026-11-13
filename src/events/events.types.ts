@@ -33,6 +33,20 @@ export type ServerEvent =
       data: { id: string; streamId: string };
     }
   | {
+      /** A donation to this stream was paid. Only sent to the stream room (chat.join). */
+      event: 'donation.received';
+      data: {
+        id: string;
+        streamId: string;
+        /** null when anonymous */
+        donorName: string | null;
+        /** so'm */
+        amount: number;
+        message: string | null;
+        paidAt: string;
+      };
+    }
+  | {
       event: 'stream.viewers';
       /** Every live stream's current count, sent every VIEWERS_POLL_SECONDS. */
       data: { id: string; viewers: number }[];

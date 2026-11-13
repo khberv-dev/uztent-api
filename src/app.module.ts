@@ -6,6 +6,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { join } from 'node:path';
 import { AuthModule } from './auth/auth.module.js';
 import { ChatModule } from './chat/chat.module.js';
+import { DonationsModule } from './donations/donations.module.js';
 import { EventsModule } from './events/events.module.js';
 import { validationPipe } from './common/pipes/validation.pipe.js';
 import { createDataSource } from './shared/config/database.config.js';
@@ -39,6 +40,7 @@ import { UsersModule } from './users/users.module.js';
     VodsModule,
     StreamsModule,
     ChatModule,
+    DonationsModule,
   ],
   providers: [
     { provide: APP_PIPE, useValue: validationPipe },

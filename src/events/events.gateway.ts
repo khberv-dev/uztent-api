@@ -22,7 +22,8 @@ type Client = WebSocket & { isAlive?: boolean; chats?: Set<string> };
 /**
  * Public: `ws://<host>:<PORT>/ws`, JSON `{ event, data }` both ways.
  * - stream.* events go to every client.
- * - chat.* events go only to clients that sent `chat.join` for that stream.
+ * - chat.* and donation.received go only to clients that sent `chat.join` for
+ *   that stream (the stream room).
  * Sending chat messages is REST (POST /streams/:id/chat), so the socket needs
  * no auth.
  */
@@ -96,7 +97,8 @@ export class EventsGateway
     const chatId =
       event.event === 'chat.message' ||
       event.event === 'chat.deleted' ||
-      event.event === 'chat.settings'
+      event.event === 'chat.settings' ||
+      event.event === 'donation.received'
         ? event.data.streamId
         : null;
 

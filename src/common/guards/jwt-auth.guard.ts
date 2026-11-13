@@ -37,12 +37,25 @@ export class JwtAuthGuard implements CanActivate {
       context.getHandler(),
       context.getClass(),
     ]);
-    if (isPublic) return true;
-
     const request = context
       .switchToHttp()
       .getRequest<Request & { user?: AuthUser }>();
     const [scheme, token] = request.headers.authorization?.split(' ') ?? [];
+
+    if (isPublic) {
+      // Optional login: a valid token identifies the caller (e.g. a donor),
+      // a missing or invalid one is simply ignored.
+      if (scheme === 'Bearer' && token) {
+        try {
+          const payload = await this.jwtService.verifyAsync<JwtPayload>(token);
+          request.user = { id: payload.sub };
+        } catch {
+          /* anonymous */
+        }
+      }
+      return true;
+    }
+
     if (scheme !== 'Bearer' || !token) {
       throw new UnauthorizedException();
     }

@@ -1,6 +1,6 @@
 # Uztent: documentation
 
-The Uztent streaming platform, in one place: how the backend works, its REST and WebSocket APIs, the MediaMTX integration, use cases, and a complete React web client.
+The Uztent streaming platform, in one place: how the backend works, its REST and WebSocket APIs, the MediaMTX and Multicard integrations, use cases, and a complete React web client.
 
 - [Overview](#overview)
 - [How it works](#how-it-works)
@@ -9,6 +9,7 @@ The Uztent streaming platform, in one place: how the backend works, its REST and
 - [REST API](#rest-api)
 - [WebSocket events](#websocket-events)
 - [MediaMTX integration](#mediamtx-integration)
+- [Multicard integration (donations)](#multicard-integration-donations)
 - [React web client](#react-web-client)
 - [Error reference](#error-reference)
 - [Configuration](#configuration)
@@ -43,7 +44,8 @@ The lifecycle of a broadcast:
 3. **Rendition:** MediaMTX's ffmpeg republishes the source as the `1080` rendition (stream copy, no re-encoding). Viewers play it, or the original `url`, over HLS.
 4. **While live:** every 5 s the API reads MediaMTX's reader list, updates `viewers`/`peakViewers` and broadcasts `stream.viewers`.
 5. **Chat:** logged-in viewers post with `POST /streams/:id/chat`. Messages are stored in Postgres and pushed to everyone who joined that stream's chat on the WebSocket. The streamer and the moderators they appoint can delete messages and ban users, and the streamer can turn on slow mode.
-6. **End:** MediaMTX reports `offline`. The API saves a VOD (same id, title, peak viewers), deletes the live session and broadcasts `stream.ended`. The chat stays attached to the VOD id for replay.
+6. **Donations:** anyone can donate with `POST /streams/:id/donations`. The API creates a **Multicard** invoice and returns its payment page (`app.rhmt.uz`). When Multicard confirms the payment, the API broadcasts `donation.received` to the stream room.
+7. **End:** MediaMTX reports `offline`. The API saves a VOD (same id, title, peak viewers), deletes the live session and broadcasts `stream.ended`. The chat stays attached to the VOD id for replay.
 
 | | |
 |---|---|
@@ -68,6 +70,9 @@ The lifecycle of a broadcast:
 | POST | `/streams/me/key` | Bearer | Generate your stream key, or replace it with a new one |
 | GET | `/streams` | **Public** | List live streams, newest first |
 | GET | `/streams/:idOrUsername` | **Public** | Get one live stream by its id, or a user's live stream by username |
+| POST | `/streams/:idOrUsername/donations` | **Public** (token optional) | Donate to a live stream: returns the Multicard payment page |
+| GET | `/streams/:id/donations` | **Public** | Paid donations of a stream / VOD |
+| GET | `/donations/:id` | **Public** | One donation's status (for the return page) |
 | GET | `/vods/me` | Bearer | List your VODs |
 | GET | `/users/:userId/vods` | Bearer | List a user's VODs |
 | GET | `/vods/:id` | Bearer | Get one VOD |
@@ -75,6 +80,7 @@ The lifecycle of a broadcast:
 | POST | `/webhooks/mediamtx/auth` | IP allowlist | MediaMTX: may this client publish or read? |
 | POST | `/webhooks/mediamtx/online` | IP allowlist | MediaMTX: a broadcast went live |
 | POST | `/webhooks/mediamtx/offline` | IP allowlist | MediaMTX: a broadcast ended |
+| POST | `/webhooks/multicard` | Signed (md5) | Multicard: a donation was paid |
 | GET | `/streams/:id/chat` | **Public** | Chat history of a live stream or VOD |
 | POST | `/streams/:id/chat` | Bearer | Send a chat message (stream must be live) |
 | GET | `/streams/:id/chat/me` | Bearer | Your role in this chat, ban status, slow mode |
@@ -225,6 +231,37 @@ Every live stream has a chat. It's stored in Postgres under the **live stream id
 - `GET /streams/:id/chat/me` tells a client the user's role, ban status and the current slow mode, so it can show the right controls.
 - Deleting a VOD deletes its chat. Deleting a user deletes their messages and bans.
 
+### Donations
+
+Viewers support a streamer with money. Payments go through **Multicard** using its hosted invoice: the donor pays on Multicard's page (`app.rhmt.uz`), and the API never sees card data.
+
+1. The donor sends `POST /streams/:idOrUsername/donations { amount, message?, anonymous? }`.
+   - The API resolves the **live** stream: the app decides which stream gets the money.
+   - It saves a `pending` donation and creates a Multicard invoice whose `invoice_id` is the donation's id.
+   - It returns `checkoutUrl`.
+2. The donor pays on `checkoutUrl`. Multicard then sends them to `DONATION_RETURN_URL?donationId=<id>`.
+3. Multicard calls `POST /webhooks/multicard`. The API:
+   - checks the signature (`md5(store_id + invoice_id + amount + secret)`), the store and the amount;
+   - marks the donation `paid` exactly once;
+   - broadcasts `donation.received` to the **stream room**: every WebSocket client that sent `chat.join` for that stream.
+4. If the donor doesn't pay within `DONATION_INVOICE_TTL_SECONDS`, Multicard cancels the invoice and the donation shows as `expired`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | uuid | Also Multicard's `invoice_id` |
+| `streamId` | uuid | Live stream id (= VOD id after the stream ends) |
+| `donorName` | string \| null | Username or first name; `null` when anonymous |
+| `anonymous` | boolean | Guests are always anonymous; logged-in donors can choose |
+| `amount` | number | So'm, `DONATION_MIN_SOM`–`DONATION_MAX_SOM` (default 1,000–10,000,000). Sent to Multicard in tiyin (×100). |
+| `message` | string \| null | Optional, up to 200 characters |
+| `status` | string | `pending` → `paid`; `failed` if the invoice couldn't be created; `expired` if unpaid in time |
+| `checkoutUrl` | string \| null | Multicard payment page, only while `pending` |
+| `expiresAt` / `paidAt` / `createdAt` | ISO date-time | |
+
+- **Who can donate:** anyone. A valid access token identifies the donor (their name is shown unless `anonymous: true`). Without a token, the donation is anonymous.
+- **Limits:** you can't donate to your own stream. Invoice creation is limited to `DONATION_INVOICES_PER_MINUTE` (default 5) per user, or per IP for guests.
+- **Privacy:** the donor's user id is stored even when anonymous, so the streamer and admins can handle abuse, but it is never returned publicly.
+
 ---
 
 ## Conventions
@@ -362,6 +399,23 @@ If a user with the same email exists but has never signed in with Google, the Go
 ### 17. Watching a VOD with its chat
 
 The VOD has the same id as the live stream, so `GET /streams/<vodId>/chat` returns the chat as it was. Page back through older messages with `before` (the oldest `createdAt` you have). The streamer and moderators can still delete messages there.
+
+### 20. Viewer donates
+
+1. On the stream page, the viewer enters an amount and message, then clicks **Donate**. The app sends `POST /streams/aziz_k/donations { "amount": 20000, "message": "gg" }` (with a token if logged in) and gets **201** with `checkoutUrl`.
+2. The app redirects to `checkoutUrl`, Multicard's page on `app.rhmt.uz`, and the viewer pays by card.
+3. Multicard sends them back to `DONATION_RETURN_URL?donationId=…`. The page polls `GET /donations/:id` until `status` is `paid` (the callback can arrive a moment after the redirect).
+4. Meanwhile everyone watching the stream receives `donation.received` and sees an alert: "don_donor donated 20,000 so'm: gg".
+
+### 21. Guest or anonymous donation
+
+A logged-out visitor can donate the same way; the donation is anonymous (`donorName: null`). A logged-in viewer sends `anonymous: true` to hide their name.
+
+### 22. Payment fails or isn't completed
+
+- Multicard is down or rejects the invoice: **502**, and the donation is `failed`. Show "try again later".
+- The donor closes the payment page: after `DONATION_INVOICE_TTL_SECONDS` the donation shows as `expired`, and no event is sent.
+- A forged or mismatched callback is answered `success: false`, so Multicard cancels and refunds that payment.
 
 ---
 
@@ -1220,6 +1274,87 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
 
 ---
 
+### POST /streams/:idOrUsername/donations
+
+**Public; access token optional.** Donate to a **live** stream, given its live stream id or the streamer's username. Creates a pending donation and a Multicard invoice, and returns the payment page.
+
+**Request body**
+
+| Field | Type | Required | Rules |
+|---|---|---|---|
+| `amount` | integer | yes | So'm, `DONATION_MIN_SOM`–`DONATION_MAX_SOM` (default 1,000–10,000,000) |
+| `message` | string | no | Up to 200 characters, trimmed |
+| `anonymous` | boolean | no | Hide the donor's name (logged-in donors). Guests are always anonymous. |
+| `lang` | string | no | Payment page language: `uz`, `ru` or `en` |
+
+```http
+POST /v1/streams/aziz_k/donations
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...   (optional)
+Content-Type: application/json
+
+{
+  "amount": 20000,
+  "message": "gg",
+  "lang": "uz"
+}
+```
+
+**201 Created**
+
+```json
+{
+  "id": "2f6c1d0a-8b4e-4c3a-9f1e-7d2b5a6c8e90",
+  "streamId": "d9b86c2e-2ddb-42d4-b204-5d0f18f067b5",
+  "donorName": "don_donor",
+  "anonymous": false,
+  "amount": 20000,
+  "message": "gg",
+  "status": "pending",
+  "checkoutUrl": "https://app.rhmt.uz/invoice/f6339f31-6a09-11f0-9a1b-00505680eaf6",
+  "expiresAt": "2026-11-13T16:30:00.000Z",
+  "paidAt": null,
+  "createdAt": "2026-11-13T16:00:00.000Z"
+}
+```
+
+Redirect the donor to `checkoutUrl`.
+
+**Errors**
+
+| Status | `message` | When |
+|---|---|---|
+| 400 | `amount must be between 1000 and 10000000 so'm` | Out of range (also: not an integer, message too long, unknown field) |
+| 400 | `You can't donate to your own stream` | The donor is the streamer |
+| 404 | `User is not live` / `User not found` / `Stream not found` | No live stream to donate to |
+| 429 | `Too many donation requests, try again in a minute` | Over `DONATION_INVOICES_PER_MINUTE` |
+| 502 | `Payment provider is unavailable` / `Payment provider rejected the request` | Multicard error; the donation is saved as `failed` |
+
+---
+
+### GET /streams/:id/donations
+
+**Public.** Paid donations of a live stream or VOD (same id), newest first. `?limit=` from 1 to 100 (default 50).
+
+```http
+GET /v1/streams/d9b86c2e-2ddb-42d4-b204-5d0f18f067b5/donations?limit=20
+```
+
+**200 OK:** an array of donations (same shape as above), all with `status: "paid"` and `checkoutUrl: null`.
+
+---
+
+### GET /donations/:id
+
+**Public.** One donation, for the page Multicard returns the donor to. Poll it until `status` is no longer `pending`.
+
+```http
+GET /v1/donations/2f6c1d0a-8b4e-4c3a-9f1e-7d2b5a6c8e90
+```
+
+**200 OK:** the donation. `status` is `pending`, `paid`, `failed` or `expired`. **Errors:** `400` (not a UUID), `404` `Donation not found`.
+
+---
+
 ### GET /vods/me
 
 **Bearer.** The caller's VODs, newest first. [Paginated](#conventions).
@@ -1324,7 +1459,7 @@ Live stream changes are pushed to clients over a WebSocket, so nobody needs to p
 | Format | Text frames with JSON: `{ "event": "<name>", "data": … }` |
 | Keep-alive | The server pings every 30 s and closes connections that don't answer. Browsers answer automatically. |
 
-`stream.*` events go to **every** client. `chat.message`, `chat.deleted` and `chat.settings` go only to clients that joined that stream's chat.
+`stream.*` events go to **every** client. `chat.message`, `chat.deleted`, `chat.settings` and `donation.received` go only to clients in that stream's room (joined with `chat.join`).
 
 ### `stream.started`
 
@@ -1436,6 +1571,26 @@ The streamer changed the chat settings (currently slow mode). Update the slow mo
 { "event": "chat.settings", "data": { "streamId": "d9b86c2e-2ddb-42d4-b204-5d0f18f067b5", "slowModeSeconds": 30 } }
 ```
 
+### `donation.received`
+
+A donation to this stream was paid. Sent once per donation, to the stream room (`chat.join`). Show an on-screen alert.
+
+```json
+{
+  "event": "donation.received",
+  "data": {
+    "id": "2f6c1d0a-8b4e-4c3a-9f1e-7d2b5a6c8e90",
+    "streamId": "d9b86c2e-2ddb-42d4-b204-5d0f18f067b5",
+    "donorName": "don_donor",
+    "amount": 20000,
+    "message": "gg",
+    "paidAt": "2026-11-13T16:15:00.000Z"
+  }
+}
+```
+
+`donorName` is `null` for anonymous donations, and `amount` is in so'm.
+
 ### How clients should use it
 
 1. Load the current state over REST (`GET /streams`, or `GET /streams/:idOrUsername` for one channel).
@@ -1445,7 +1600,7 @@ The streamer changed the chat settings (currently slow mode). Update the slow mo
 
 ### Several API instances
 
-`stream.started`, `stream.ended`, `chat.message`, `chat.deleted` and `chat.settings` go through Redis pub/sub, so clients get them whichever instance they're connected to. Every instance runs its own viewer poll and sends `stream.viewers` to its own clients.
+`stream.started`, `stream.ended`, `chat.message`, `chat.deleted`, `chat.settings` and `donation.received` go through Redis pub/sub, so clients get them whichever instance they're connected to. Every instance runs its own viewer poll and sends `stream.viewers` to its own clients.
 
 ### Try it
 
@@ -1590,6 +1745,54 @@ paths:
 - **Viewer counts** need `api: yes` and the API's `MEDIAMTX_API_URL` pointing at it. Keep that port private, since `authHTTPExclude` lets anyone reach it without auth.
 - **Redirect:** HLS players get a `302` to `…/index.m3u8?cookieCheck=1` first. That's MediaMTX's normal session redirect, and HLS players follow it.
 - **Config reloads:** MediaMTX reloads `mediamtx.yml` automatically when it changes.
+---
+
+## Multicard integration (donations)
+
+Donations use Multicard's **hosted invoice** strategy ([docs.multicard.uz](https://docs.multicard.uz)): the API creates an invoice, the donor pays on Multicard's page, and Multicard calls back.
+
+| Step | Multicard API | Notes |
+|---|---|---|
+| Token | `POST /auth { application_id, secret }` | JWT, cached until shortly before `expiry` (GMT+5). A `401` triggers a new token and one retry. |
+| Invoice | `POST /payment/invoice` | `store_id`, `amount` (tiyin), `invoice_id` = donation id, `callback_url`, `return_url` (`DONATION_RETURN_URL?donationId=…`), `lang`, `ttl` (no `ofd` fiscal data). Returns `uuid` and `checkout_url` (`app.rhmt.uz`). |
+| Callback | → `POST /v1/webhooks/multicard` | See below |
+
+### POST /webhooks/multicard
+
+Called by Multicard after a successful payment (`callback_url`). Always answers HTTP 200; Multicard reads `success`.
+
+```json
+{
+  "store_id": 6,
+  "amount": 2000000,
+  "invoice_id": "2f6c1d0a-8b4e-4c3a-9f1e-7d2b5a6c8e90",
+  "billing_id": "BILL-0001",
+  "payment_time": "2026-11-13 21:15:00",
+  "phone": "998901234567",
+  "card_pan": "860000******0000",
+  "ps": "uzcard",
+  "card_token": "6225f3c93f7a880142782fa4",
+  "uuid": "f6339f31-6a09-11f0-9a1b-00505680eaf6",
+  "receipt_url": "https://ofd.example/check/1",
+  "sign": "0123456789abcdef0123456789abcdef"
+}
+```
+
+| Reply | When |
+|---|---|
+| `{ "success": true }` | Valid and newly paid, or a repeat of the same payment (same `uuid`) |
+| `{ "success": false, "message": "Invalid signature" }` | `sign` ≠ `md5(store_id + invoice_id + amount + MULTICARD_SECRET)` |
+| `{ "success": false, "message": "Unknown store" }` / `"Amount mismatch"` / `"Invoice not found"` / `"Missing fields"` | Doesn't match a donation |
+| `{ "success": false, "message": "Invoice already paid" }` | A **different** payment for an already-paid donation |
+
+Anything but `success: true` makes Multicard cancel and refund that payment. A donation is marked paid with a conditional update, so concurrent or repeated callbacks produce exactly one `donation.received`.
+
+### Multicard setup
+
+1. Get `application_id`, `secret` and `store_id` from Multicard, and set `MULTICARD_*` in `.env`. Use `https://dev-mesh.multicard.uz` while testing (test card `8600 5333 6409 8829`, expiry `28/06`, OTP `111111`), then `https://mesh.multicard.uz`.
+2. Set `MULTICARD_CALLBACK_URL` to the API's **public** HTTPS URL + `/v1/webhooks/multicard`. Multicard calls it from `195.158.26.90`.
+3. Point `DONATION_RETURN_URL` at the web app page that shows the result.
+
 ---
 
 ## React web client
@@ -3108,6 +3311,165 @@ export const promoteToModerator = (userId: string) => addModerator(userId);
 - **Ban:** use the message's `userId` with `banInChat(streamId, userId)`. Bans apply to all of the streamer's streams.
 - **VOD replay:** `useChat(vod.id)` shows the stored chat. Sending fails with 404, so hide the input for VODs.
 
+### Donate form and alerts
+
+The donate form creates the donation and redirects to Multicard's payment page. Logged-in donors are identified through the same fetch wrapper, and guests donate without a token.
+
+```tsx
+// src/components/DonateForm.tsx
+import { useState, type FormEvent } from 'react';
+import { ApiError } from '../api/client';
+import { createDonation } from '../api/endpoints';
+import { useAuth } from '../auth/AuthProvider';
+
+const MIN = 1_000;
+const MAX = 10_000_000;
+
+/** Donate to a live stream: creates the invoice, then opens the Multicard (rhmt) payment page. */
+export function DonateForm({ target }: { target: string /* live stream id or username */ }) {
+  const { user } = useAuth();
+  const [amount, setAmount] = useState(10_000);
+  const [message, setMessage] = useState('');
+  const [anonymous, setAnonymous] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      const donation = await createDonation(target, {
+        amount,
+        message: message.trim() || undefined,
+        anonymous: user ? anonymous : undefined,
+        lang: 'uz',
+      });
+      // Multicard returns the donor to DONATION_RETURN_URL?donationId=… afterwards.
+      if (donation.checkoutUrl) window.location.href = donation.checkoutUrl;
+    } catch (err) {
+      // 400 amount/message, 404 "User is not live", 429 too many, 502 payment provider
+      setError(err instanceof ApiError ? err.message : 'Could not start the payment');
+      setBusy(false);
+    }
+  };
+
+  return (
+    <form onSubmit={submit}>
+      <label>
+        Amount (so'm)
+        <input
+          type="number"
+          min={MIN}
+          max={MAX}
+          step={1}
+          value={amount}
+          onChange={(e) => setAmount(Math.trunc(Number(e.target.value)))}
+        />
+      </label>
+      <input
+        placeholder="Message (optional)"
+        maxLength={200}
+        value={message}
+        onChange={(e) => setMessage(e.target.value)}
+      />
+      {user ? (
+        <label>
+          <input type="checkbox" checked={anonymous} onChange={(e) => setAnonymous(e.target.checked)} />
+          Donate anonymously
+        </label>
+      ) : (
+        <p>You are not signed in, so your donation will be anonymous.</p>
+      )}
+      <button disabled={busy || amount < MIN || amount > MAX}>Donate</button>
+      {error && <p role="alert">{error}</p>}
+    </form>
+  );
+}
+```
+
+Return page (route at `DONATION_RETURN_URL`):
+
+```tsx
+// src/components/DonationReturnPage.tsx
+import { useEffect, useState } from 'react';
+import { getDonation } from '../api/endpoints';
+import type { Donation } from '../api/types';
+
+/**
+ * Page at DONATION_RETURN_URL. Multicard sends the donor here with
+ * ?donationId=…; the callback may arrive a moment later, so poll until final.
+ */
+export function DonationReturnPage() {
+  const donationId = new URLSearchParams(window.location.search).get('donationId');
+  const [donation, setDonation] = useState<Donation | null>(null);
+
+  useEffect(() => {
+    if (!donationId) return;
+    let timer: ReturnType<typeof setTimeout>;
+    let tries = 0;
+    const check = () =>
+      getDonation(donationId)
+        .then((d) => {
+          setDonation(d);
+          if (d.status === 'pending' && ++tries < 30) timer = setTimeout(check, 2000);
+        })
+        .catch(() => {
+          timer = setTimeout(check, 2000);
+        });
+    void check();
+    return () => clearTimeout(timer);
+  }, [donationId]);
+
+  if (!donationId) return <p>Missing donation id.</p>;
+  if (!donation) return <p>Checking your payment…</p>;
+  switch (donation.status) {
+    case 'paid':
+      return <p>Thank you! Your donation of {donation.amount.toLocaleString()} so'm was sent.</p>;
+    case 'pending':
+      return <p>Waiting for payment confirmation…</p>;
+    case 'expired':
+      return <p>The payment link expired. Please try again.</p>;
+    default:
+      return <p>The payment did not go through.</p>;
+  }
+}
+```
+
+On-stream alerts for everyone watching. The hook joins the stream room itself, so it works without the chat panel:
+
+```ts
+// src/hooks/useDonationAlerts.ts
+import { useEffect, useState } from 'react';
+import { joinChat, type ServerEvent } from '../api/events';
+import { useServerEvents } from './useServerEvents';
+
+type DonationEvent = Extract<ServerEvent, { event: 'donation.received' }>['data'];
+
+/**
+ * Donations to this stream as they're paid (for an on-screen alert).
+ * Joins the stream room itself, so it works without the chat panel.
+ */
+export function useDonationAlerts(streamId: string, keep = 20) {
+  const [alerts, setAlerts] = useState<DonationEvent[]>([]);
+
+  useEffect(() => joinChat(streamId), [streamId]);
+
+  useServerEvents((e) => {
+    if (e.event === 'donation.received' && e.data.streamId === streamId) {
+      setAlerts((list) => [e.data, ...list].slice(0, keep));
+    }
+  });
+
+  return alerts;
+}
+```
+
+```tsx
+const alerts = useDonationAlerts(stream.id);
+// alerts[0] → { donorName: 'don_donor' | null, amount: 20000, message: 'gg', … }
+```
+
 ### VOD list
 
 ```tsx
@@ -3195,6 +3557,9 @@ export function MyVods() {
 | `listChatBans()` / `banFromChat(userId)` / `unbanFromChat(userId)` | `/streams/me/bans` | Streamer's own channel |
 | `listModerators()` / `addModerator(userId)` / `removeModerator(userId)` | `/streams/me/moderators` | Streamer's own channel |
 | `updateStream({ title?, chatSlowModeSeconds? })` | `PATCH /streams/me` | Title and slow mode |
+| `createDonation(target, { amount, message?, anonymous?, lang? })` | `POST /streams/:idOrUsername/donations` | **Public**, token optional; redirect to `checkoutUrl` |
+| `getDonation(id)` | `GET /donations/:id` | **Public**; poll on the return page |
+| `listStreamDonations(streamId, limit?)` | `GET /streams/:id/donations` | **Public**; paid only |
 | `joinChat(streamId)` | WS `chat.join` / `chat.leave` | Ref-counted; returns a leave function |
 
 The `/webhooks/mediamtx/*` endpoints are for the media server only. The web app never calls them.
@@ -3213,6 +3578,7 @@ The `/webhooks/mediamtx/*` endpoints are for the media server only. The web app 
 8. **Stream key secrecy:** don't log `encoderStreamKey`, send it to analytics, or show it unmasked by default.
 9. **WebSocket URL has no `/v1`:** it's `ws://host:port/ws`. Events aren't replayed after a disconnect; `useServerEvents`' `onReconnect` reloads state.
 10. **Chat needs `chat.join`:** without it the socket never delivers `chat.message`. Use `joinChat()`/`useChat()` rather than sending raw frames, so joins survive reconnects.
+11. **Donation results come from the server, not the redirect:** Multicard redirects to `DONATION_RETURN_URL` whether or not the payment succeeded. Always check `GET /donations/:id`.
 
 ---
 
@@ -3229,6 +3595,8 @@ The `/webhooks/mediamtx/*` endpoints are for the media server only. The web app 
 | 404 `Stream not found` / `VOD not found` / `User is not live` | Doesn't exist (or the stream ended) | Show "not found"; for an ended stream, open the VOD with the same `id` |
 | 403 `You are banned from this chat` | The streamer banned you | Disable the chat input |
 | 409 | Unique value already taken | Ask for a different value |
+| 429 `Too many donation requests…` | Donation invoice rate limit | Ask the donor to wait a minute |
+| 502 `Payment provider …` | Multicard unavailable or rejected the invoice | Show "payments are unavailable, try again later" |
 | 429 `You are sending messages too fast` | Chat rate limit (`CHAT_MESSAGE_INTERVAL_MS`) | Keep the text and let the user retry a moment later |
 | 429 `Slow mode is on: wait N s …` | Chat slow mode (viewers) | Show the wait time; keep the text |
 | 403 `Only the streamer and moderators can do this` / `Moderators can't ban other moderators` | Moderation not allowed | Hide those controls (see `GET /streams/:id/chat/me`) |
@@ -3259,6 +3627,14 @@ Set in `.env` (see `.env.example`). The server won't start if any of these is mi
 | `STREAM_RENDITIONS` | `1080` | Qualities the MediaMTX transcoder publishes to `watch/<id>/<quality>`; returned as `renditions`, highest first |
 | `WEBHOOK_ALLOWED_IPS` | `127.0.0.1,::1,10.0.0.0/8` | Comma-separated IPs or CIDR masks (IPv4 or IPv6) allowed to call `/webhooks/*`, i.e. MediaMTX's address. An invalid entry stops the server at startup. |
 | `CHAT_MESSAGE_INTERVAL_MS` | `1000` | Minimum time between two chat messages from the same user, in any chat. Applies to everyone (slow mode is extra, per channel, viewers only). |
+| `MULTICARD_API_URL` | `https://dev-mesh.multicard.uz` | Multicard API (sandbox; production: `https://mesh.multicard.uz`) |
+| `MULTICARD_APPLICATION_ID`, `MULTICARD_SECRET` | from Multicard | API credentials. The secret also verifies callback signatures. |
+| `MULTICARD_STORE_ID` | from Multicard | Cash desk (kassa) receiving donations |
+| `MULTICARD_CALLBACK_URL` | `https://api.example.uz/v1/webhooks/multicard` | Public URL Multicard calls after payment |
+| `DONATION_MIN_SOM`, `DONATION_MAX_SOM` | `1000`, `10000000` | Allowed amount in so'm |
+| `DONATION_INVOICE_TTL_SECONDS` | `1800` | Unpaid invoices are cancelled after this |
+| `DONATION_INVOICES_PER_MINUTE` | `5` | Invoice creation limit per user (or IP for guests) |
+| `DONATION_RETURN_URL` | `http://localhost:5173/donations/complete` | Where Multicard sends the donor after paying (`?donationId=` appended) |
 | `STREAM_PUBLISH_URL` | `rtmp://localhost:1935/live` | MediaMTX's public RTMP address plus `/live`, returned as `publishUrl`. It's saved on the user's stream settings when the key is generated, so changing it only affects keys generated afterwards. |
 
 The database schema is created and updated automatically from the entities at startup (TypeORM `synchronize`). There are no migrations.
@@ -3297,3 +3673,9 @@ Deploy the `public/` folder next to `dist/`. Anything put there is publicly down
   - `senderRole` is a snapshot: messages sent before a promotion or demotion keep their old badge.
   - A ban doesn't remove the user's earlier messages.
   - Chat history is never trimmed.
+- **Donation limitations:**
+  - Tested only against a local mock of Multicard, built from its documentation. Verify with real sandbox credentials before going live.
+  - Invoices are sent **without** `ofd` (fiscal receipt data). Multicard's schema marks `ofd` as required, so confirm with Multicard that your store accepts invoices without it.
+  - The callback is trusted by its md5 signature only; its source IP (`195.158.26.90`) isn't enforced.
+  - No refunds, streamer payouts or earnings report in the API yet. Money settles to the Multicard store, and payouts to streamers are handled outside the app.
+  - A donation that Multicard pays after `expiresAt` (e.g. a late callback) is still accepted and announced.

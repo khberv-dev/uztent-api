@@ -36,6 +36,7 @@ Vitest runs with `globals: true`, and `vite-tsconfig-paths` resolves tsconfig pa
 - `REDIS_URL`; `HLS_BASE_URL`, the MediaMTX HLS root (original = `/live/<streamId>/index.m3u8`, renditions = `/watch/<streamId>/<quality>/index.m3u8`); `STREAM_RENDITIONS` (currently `1080`)
 - `STREAM_PUBLISH_URL`: the encoder's ingest server, saved on a user's `Stream` row when their key is generated
 - `MEDIAMTX_API_URL` (MediaMTX control API, needs `api: yes`) and `VIEWERS_POLL_SECONDS`
+- `MULTICARD_*` and `DONATION_*`: payment gateway credentials, callback and return URLs, and donation limits (see docs.md "Configuration")
 - `WEBHOOK_ALLOWED_IPS`: comma-separated IPs or CIDR masks allowed to call `/webhooks/*`; an invalid entry fails at startup
 
 ## Architecture
@@ -85,6 +86,12 @@ Vitest runs with `globals: true`, and `vite-tsconfig-paths` resolves tsconfig pa
     - `senderRole` is stored on each message as a badge snapshot.
     - `EventsGateway` handles `chat.join` / `chat.leave` (`@SubscribeMessage`, at most 10 per connection) and sends `chat.*` only to clients that joined.
     - `JwtAuthGuard` skips non-HTTP contexts, because as an `APP_GUARD` it also runs on WebSocket messages.
+  - **Donations** (`src/donations`, `src/payments/multicard.service.ts`) use Multicard's hosted-invoice strategy:
+    - `POST /streams/:idOrUsername/donations` is `@Public()`. A valid token still identifies the donor: `JwtAuthGuard` verifies tokens on public routes when present, and `@OptionalUser()` reads them.
+    - It needs a live stream, saves a `Donation` (status `pending`; its id is Multicard's `invoice_id`), creates the invoice (amount in **tiyin**, no `ofd` fiscal data), and returns `checkoutUrl` (`app.rhmt.uz`).
+    - `MulticardService` caches the `/auth` token until `expiry` (GMT+5) and retries once on 401.
+    - `POST /webhooks/multicard` always returns 200 with `{ success }`. Anything else makes Multicard refund. It verifies `md5(store_id+invoice_id+amount+secret)`, the store and the amount, then marks the donation paid with a conditional update (`status != 'paid'`). Only that update publishes `donation.received`, to the stream room, the same routing as `chat.*`.
+    - Tests use a local fake Multicard; it hasn't been verified against the real sandbox yet.
   - `previewUri`/`videoUri` stay null until a media-pipeline integration exists.
 - **Auth flows** (`src/auth`):
   - **Google**: `POST /auth/google` takes an ID token, verifies it with `google-auth-library`, and finds the user by `googleId`. Failing that it auto-links an existing user by verified email, otherwise it creates one. Google is the only way users are created; there is no password sign-up.
