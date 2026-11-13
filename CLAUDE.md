@@ -65,10 +65,10 @@ Vitest runs with `globals: true`, and `vite-tsconfig-paths` resolves tsconfig pa
   - Live-stream playback URLs (`url` + `renditions`) aren't stored. `LiveStreamsService.toLiveStream` builds them on every read from the stored `streamId`, so `HLS_BASE_URL`/`STREAM_RENDITIONS` changes apply to sessions that are already live.
   - A live stream exists only in Redis. The keys are `stream:<id>` (hash, including an internal `peakViewers`), `stream:user:<userId>` (the user's single live stream, claimed with `SET NX`) and `streams:live` (a sorted set scored by start time).
   - Ending a live session (`LiveStreamsService.end`) first inserts a `Vod` with the **same id** as the stream, then deletes the Redis keys, so a failed insert leaves the stream live and the webhook can be retried. `VodsService.create` is idempotent on that id.
-  - `ViewerCounterService` polls MediaMTX `GET /v3/paths/list` (`MEDIAMTX_API_URL`) every `VIEWERS_POLL_SECONDS`:
-    - It counts readers on `live/<streamId>` and `watch/<streamId>/*`, excluding the transcoder's `rtspSession` reader on `live/`.
+  - `ViewerCounterService` polls MediaMTX (`MEDIAMTX_API_URL`) every `VIEWERS_POLL_SECONDS`:
+    - HLS viewers come from `GET /v3/hlssessions/list`: a session on `live/<streamId>` or `watch/<streamId>/*` counts only while its `outboundBytes` keeps growing (last growth within max(10 s, 2 polls); a new session needs ≥16 KiB, i.e. media, not just the playlist). Every playlist load opens a new MediaMTX session (reload, quality switch, hls.js error recovery, link previews) and idle ones linger ~30 s, so counting raw sessions overcounts. Byte counts are kept in memory per instance.
+    - Non-HLS readers come from `GET /v3/paths/list`, excluding `hlsSession` and the transcoder's `rtspSession` reader on `live/`.
     - A Lua script sets `viewers` and the running max `peakViewers`, but only if the hash still exists, so a poll racing with stream end can't recreate it.
-    - MediaMTX drops HLS sessions about 40 s after the last request, so counts lag on the way down.
   - **WebSocket events** (`src/events`):
     - `EventsGateway` serves `ws://host:PORT/ws` with `@nestjs/platform-ws` (`WsAdapter` in `main.ts`). It isn't under `API_PREFIX`, has no auth, and is server→client only, with a 30 s ping to drop dead connections.
     - `EventsService.publish()` sends `stream.started` / `stream.ended` over Redis pub/sub (channel `events`, on a duplicated subscriber connection), so every instance relays them.

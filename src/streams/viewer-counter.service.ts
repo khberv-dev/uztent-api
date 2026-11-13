@@ -20,8 +20,28 @@ interface MediamtxPathList {
   }[];
 }
 
+/** Subset of MediaMTX `GET /v3/hlssessions/list`. */
+interface MediamtxHlsSessionList {
+  pageCount: number;
+  items: { id: string; path: string; outboundBytes: number }[];
+}
+
 /** `live/<streamId>` or `watch/<streamId>/<quality>` → streamId. */
 const STREAM_PATH = /^(?:live|watch)\/([0-9a-f-]{36})(?:\/|$)/i;
+
+/**
+ * A session seen for the first time counts only if it already received media:
+ * fetching just the multivariant playlist (link previews, crawlers, a reload
+ * that replaced the session) sends a few hundred bytes.
+ */
+const MIN_MEDIA_BYTES = 16 * 1024;
+
+/**
+ * A playing HLS client requests something at least every target duration
+ * (~2 s, playlist reloads included), so a session that sent nothing for this
+ * long has been abandoned, even though MediaMTX keeps it ~30 s more.
+ */
+const MIN_ACTIVE_WINDOW_MS = 10_000;
 
 /**
  * Sets `viewers` and keeps the max in `peakViewers`, only if the session still
@@ -39,9 +59,12 @@ return 1
 /**
  * Polls MediaMTX's API and writes each live session's viewer count.
  *
- * Every HLS player is a reader (`hlsSession`) on the path it plays, so viewers
- * = readers on `live/<id>` and `watch/<id>/*`, minus the transcoder's RTSP
- * read of `live/<id>` (see mediamtx.yml).
+ * HLS viewers are MediaMTX HLS sessions on `live/<id>` and `watch/<id>/*`
+ * that are still downloading (their `outboundBytes` grew recently). Counting
+ * every session would overcount: each playlist load opens a new one (page
+ * reload, quality switch, player error recovery) and an abandoned one lingers
+ * ~30 s. Other readers (e.g. RTMP players) are counted from the path list,
+ * minus the transcoder's RTSP read of `live/<id>` (see mediamtx.yml).
  */
 @Injectable()
 export class ViewerCounterService
@@ -50,9 +73,15 @@ export class ViewerCounterService
   private readonly logger = new Logger(ViewerCounterService.name);
   private readonly apiUrl: string;
   private readonly intervalMs: number;
+  private readonly activeWindowMs: number;
   private timer?: NodeJS.Timeout;
   private running = false;
   private failing = false;
+  /** HLS session id → bytes at the last poll and when they last grew. */
+  private readonly hlsSessions = new Map<
+    string,
+    { bytes: number; lastActiveAt: number | null }
+  >();
 
   constructor(
     @Inject(REDIS) private readonly redis: Redis,
@@ -64,6 +93,7 @@ export class ViewerCounterService
       .getOrThrow<string>('MEDIAMTX_API_URL')
       .replace(/\/+$/, '');
     this.intervalMs = Number(config.getOrThrow('VIEWERS_POLL_SECONDS')) * 1000;
+    this.activeWindowMs = Math.max(MIN_ACTIVE_WINDOW_MS, 2 * this.intervalMs);
   }
 
   onApplicationBootstrap() {
@@ -80,7 +110,10 @@ export class ViewerCounterService
     this.running = true;
     try {
       const sessions = await this.liveStreamsService.listSessionKeys();
-      if (sessions.length === 0) return;
+      if (sessions.length === 0) {
+        this.hlsSessions.clear();
+        return;
+      }
 
       const counts = await this.countViewersByStream();
       const pipeline = this.redis.pipeline();
@@ -112,33 +145,72 @@ export class ViewerCounterService
   }
 
   private async countViewersByStream(): Promise<Map<string, number>> {
+    const [paths, hlsSessions] = await Promise.all([
+      this.list<MediamtxPathList>('/v3/paths/list'),
+      this.list<MediamtxHlsSessionList>('/v3/hlssessions/list'),
+    ]);
     const counts = new Map<string, number>();
+    const add = (path: string, viewers: number) => {
+      const streamId = STREAM_PATH.exec(path)?.[1]?.toLowerCase();
+      if (streamId && viewers) {
+        counts.set(streamId, (counts.get(streamId) ?? 0) + viewers);
+      }
+    };
 
+    for (const path of paths) {
+      const isSource = path.name.startsWith('live/');
+      add(
+        path.name,
+        path.readers.filter(
+          (reader) =>
+            // HLS sessions are counted below, by activity.
+            reader.type !== 'hlsSession' &&
+            // The transcoder reads the source over RTSP (bound to 127.0.0.1).
+            !(isSource && reader.type === 'rtspSession'),
+        ).length,
+      );
+    }
+
+    const now = Date.now();
+    const seen = new Set<string>();
+    for (const session of hlsSessions) {
+      seen.add(session.id);
+      const bytes = Number(session.outboundBytes) || 0;
+      const previous = this.hlsSessions.get(session.id);
+      let lastActiveAt: number | null;
+      if (!previous) {
+        lastActiveAt = bytes >= MIN_MEDIA_BYTES ? now : null;
+      } else {
+        lastActiveAt = bytes > previous.bytes ? now : previous.lastActiveAt;
+      }
+      this.hlsSessions.set(session.id, { bytes, lastActiveAt });
+      if (lastActiveAt !== null && now - lastActiveAt <= this.activeWindowMs) {
+        add(session.path, 1);
+      }
+    }
+    for (const id of this.hlsSessions.keys()) {
+      if (!seen.has(id)) this.hlsSessions.delete(id);
+    }
+    return counts;
+  }
+
+  /** All pages of a MediaMTX list endpoint. */
+  private async list<T extends { pageCount: number; items: unknown[] }>(
+    endpoint: string,
+  ): Promise<T['items']> {
+    const items: T['items'] = [];
     for (let page = 0, pageCount = 1; page < pageCount; page++) {
       const response = await fetch(
-        `${this.apiUrl}/v3/paths/list?itemsPerPage=1000&page=${page}`,
+        `${this.apiUrl}${endpoint}?itemsPerPage=1000&page=${page}`,
         { signal: AbortSignal.timeout(3000) },
       );
       if (!response.ok) {
-        throw new Error(`MediaMTX API responded ${response.status}`);
+        throw new Error(`MediaMTX ${endpoint} responded ${response.status}`);
       }
-      const list = (await response.json()) as MediamtxPathList;
+      const list = (await response.json()) as T;
       pageCount = list.pageCount;
-
-      for (const path of list.items) {
-        const streamId = STREAM_PATH.exec(path.name)?.[1]?.toLowerCase();
-        if (!streamId) continue;
-
-        const isSource = path.name.startsWith('live/');
-        const viewers = path.readers.filter(
-          // The transcoder reads the source over RTSP; viewers use HLS
-          // (RTSP is bound to 127.0.0.1 in mediamtx.yml).
-          (reader) => !(isSource && reader.type === 'rtspSession'),
-        ).length;
-
-        counts.set(streamId, (counts.get(streamId) ?? 0) + viewers);
-      }
+      items.push(...list.items);
     }
-    return counts;
+    return items;
   }
 }

@@ -27,7 +27,7 @@ Uztent is a live-streaming backend. Streamers broadcast from OBS (or any RTMP en
       ▼                                         HLS     │   │ REST + WebSocket
  ┌──────────┐  auth / online / offline  ┌──────────┐    │   │
  │ MediaMTX │ ────────── webhooks ────▶ │   API    │ ◀──┼───┘
- │          │ ◀──── /v3/paths/list ──── │ (NestJS) │    │
+ │          │ ◀── /v3/hlssessions ───── │ (NestJS) │    │
  │  ffmpeg  │       (viewer counts)     └────┬─────┘    │
  │  → 1080  │                              │      │     │
  │          │ ──────────────── HLS ────────┼──────┼─────┘
@@ -42,7 +42,7 @@ The lifecycle of a broadcast:
 1. **Setup:** the user generates a stream key (`POST /streams/me/key`) and pastes it into OBS.
 2. **Go live:** MediaMTX asks the API to check the key (auth webhook). Once video flows, it reports `online`. The API creates a live session in Redis and broadcasts `stream.started`.
 3. **Rendition:** MediaMTX's ffmpeg republishes the source as the `1080` rendition (stream copy, no re-encoding). Viewers play it, or the original `url`, over HLS.
-4. **While live:** every 5 s the API reads MediaMTX's reader list, updates `viewers`/`peakViewers` and broadcasts `stream.viewers`.
+4. **While live:** every 5 s the API reads MediaMTX's HLS sessions and reader list, updates `viewers`/`peakViewers` and broadcasts `stream.viewers`.
 5. **Chat:** logged-in viewers post with `POST /streams/:id/chat`. Messages are stored in Postgres and pushed to everyone who joined that stream's chat on the WebSocket. The streamer and the moderators they appoint can delete messages and ban users, and the streamer can turn on slow mode.
 6. **Donations:** anyone can donate with `POST /streams/:id/donations`. The API creates a **Multicard** invoice and returns its payment page (`app.rhmt.uz`). When Multicard confirms the payment, the API broadcasts `donation.received` to the stream room.
 7. **End:** MediaMTX reports `offline`. The API saves a VOD (same id, title, peak viewers), deletes the live session and broadcasts `stream.ended`. The chat stays attached to the VOD id for replay.
@@ -192,7 +192,7 @@ A live session exists only while the user is broadcasting. It's kept in **Redis*
 | `userId` | uuid | The streamer |
 | `title` | string | Copied from the stream settings when publishing starts. `PATCH /streams/me` also renames the live session. |
 | `startedAt` | ISO date-time | |
-| `viewers` | number | Current viewers across the original and all renditions, read from MediaMTX every `VIEWERS_POLL_SECONDS`. New viewers appear within one poll; viewers who leave are dropped about **40 s** later (MediaMTX keeps an HLS session that long after its last request). |
+| `viewers` | number | Current viewers across the original and all renditions, read from MediaMTX every `VIEWERS_POLL_SECONDS`. Counts players that are still downloading: an HLS session counts once it has received video and as long as it keeps requesting (it's dropped within about 10 s of the player stopping). A page reload, a quality switch or a player's error recovery opens a new session but doesn't count the viewer twice, and fetching only the playlist (link previews, crawlers) doesn't count at all. Each tab or device is one viewer. |
 | `url` | string | HLS URL of the **original** broadcast: `<HLS_BASE_URL>/live/<stream settings id>/index.m3u8`. It's the same for every broadcast by this user. |
 | `chatSlowModeSeconds` | number | Current chat slow mode (from the stream settings) |
 | `renditions` | array | Transcoded qualities, highest first: `[{ "quality": "1080p", "url": "<HLS_BASE_URL>/watch/<stream settings id>/1080/index.m3u8" }, …]`. The list comes from `STREAM_RENDITIONS`. |
@@ -3654,7 +3654,7 @@ Playback notes:
 - **Right after `stream.started`**, the `1080` rendition can take a second or two to appear (the transcoder starts after the broadcast), so the first requests can 404. The player retries every 2 s.
 - **Not yet tested in a browser:** playback has been verified with ffprobe, not with hls.js. If segments fail to load cross-origin, check MediaMTX's `hlsAllowOrigin` (default `*`).
 - **When a stream ends**, `getLiveStream(id)` returns `404`. A VOD with the **same `id`** appears in the streamer's VODs.
-- **`viewers`** arrives every 5 s through `stream.viewers`; no polling needed. Viewers who leave are dropped about 40 s later.
+- **`viewers`** arrives every 5 s through `stream.viewers`; no polling needed. Viewers who leave are dropped within about 10–15 s.
 
 ---
 
@@ -4286,8 +4286,8 @@ Deploy the `public/` folder next to `dist/`. Anything put there is publicly down
 - **No rate limiting** on `/auth/login` or the other auth endpoints yet.
 - **Expired sessions accumulate:** expired refresh-token rows are never cleaned up automatically.
 - **Viewer counts are approximate:**
-  - A viewer who leaves still counts for about 40 s.
-  - Switching quality briefly counts the viewer twice (old and new session), which can raise `peakViewers` slightly.
+  - A viewer who leaves still counts for up to about 15 s (the activity window plus one poll); a new viewer appears after one or two polls.
+  - Each browser tab or device counts separately, and a paused player that keeps reloading the playlist still counts.
   - Counts only refresh every `VIEWERS_POLL_SECONDS`, and stop updating if the MediaMTX API is unreachable. The API logs a warning when that happens.
 - **Nothing fills `previewUri` / `videoUri` yet.** The media pipeline needs a way to write them (e.g. an internal endpoint), which doesn't exist yet.
 - **Stale streams:** a live session stays in Redis until the offline webhook arrives. If MediaMTX crashes or the `curl` call fails, the session isn't ended automatically.
